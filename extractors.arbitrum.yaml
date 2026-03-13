@@ -8,7 +8,7 @@ extractors:
         protocol_types:
             - name: "uniswap_v2_pool"
               financial_type: "Swap"
-        spkg: "railway/substreams/arbitrum-uniswap-v2/arbitrum-uniswap-v2-v0.3.1.spkg"
+        spkg: "substreams/arbitrum-uniswap-v2/arbitrum-uniswap-v2-v0.3.1.spkg"
         module_name: "map_pool_events"
 
     uniswap_v3:
@@ -20,5 +20,5 @@ extractors:
         protocol_types:
             - name: "uniswap_v3_pool"
               financial_type: "Swap"
-        spkg: "railway/substreams/arbitrum-uniswap-v3/arbitrum-uniswap-v3-v0.3.1.spkg"
+        spkg: "substreams/arbitrum-uniswap-v3/arbitrum-uniswap-v3-v0.3.1.spkg"
         module_name: "map_protocol_changes"
