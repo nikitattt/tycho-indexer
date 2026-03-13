@@ -21,4 +21,4 @@ extractors:
             - name: "uniswap_v3_pool"
               financial_type: "Swap"
         spkg: "substreams/arbitrum-uniswap-v3/arbitrum-uniswap-v3-v0.3.1.spkg"
-        module_name: "map_protocol_changes"
+        module_name: "map_pool_events"
