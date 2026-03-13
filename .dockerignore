@@ -8,5 +8,6 @@ venv
 .idea
 .git
 **/*.spkg
+!railway/substreams/**/*.spkg
 Dockerfile
 .env

@@ -32,9 +32,10 @@ COPY --from=build /build/extractors*.yaml ./
 
 # Railway does not mount the local repo like docker-compose does, so if you want
 # local .spkg files instead of S3-backed retrieval they must be baked into the image.
-COPY --from=build /build/substreams ./substreams
+# In this repo the Railway-specific packages live under railway/substreams.
+COPY --from=build /build/railway/substreams ./substreams
 
-RUN apt-get update && apt-get install -y libpq-dev libcurl4 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl libpq-dev libcurl4 && rm -rf /var/lib/apt/lists/*
 
 # Railway should set the actual start command so the chain-specific endpoint,
 # config file, and PORT can be injected via variables.
