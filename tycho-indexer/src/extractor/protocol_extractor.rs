@@ -152,15 +152,15 @@ where
                 let last_processed_block = gateway
                     .get_block(block_hash)
                     .await
-                    .unwrap_or_else(|err| {
-                        panic!("Unexpected error when fetching latest block {err}");
-                    });
+                    .map_err(|err| {
+                        ExtractionError::Setup(format!("Failed to fetch latest block: {err}"))
+                    })?;
 
-                let cursor_hex = hex::encode(&cursor);
+                let cursor_str = String::from_utf8_lossy(&cursor);
                 info!(
                     ?name,
                     ?chain,
-                    cursor = &cursor_hex,
+                    cursor = %cursor_str,
                     block_number = last_processed_block.number,
                     "Found existing cursor! Resuming extractor.."
                 );
@@ -1043,7 +1043,10 @@ where
             })
     }
 
-    #[instrument(skip_all, fields(current_block, target_hash, target_number))]
+    #[instrument(
+        skip_all,
+        fields(current_block, current_partial_block_index, target_hash, target_number)
+    )]
     #[allow(clippy::mutable_key_type)] // Clippy thinks that tuple with Bytes are a mutable type.
     async fn handle_revert(
         &self,
@@ -1078,14 +1081,12 @@ where
         tracing::Span::current().record("target_hash", format!("{block_hash:x}"));
         tracing::Span::current().record("target_number", block_ref.number);
 
-        // Perf: consider optimizing this to avoid having a unique counter for every revert, which
-        // can blow up metrics memory usage in case of frequent reverts.
+        warn!("Chain reorg detected");
+
         counter!(
             "extractor_revert",
             "extractor" => self.name.clone(),
-            "current_block" => last_processed_block_number,
-            "current_partial_block_index" => current_partial_block_index,
-            "target_block" => block_ref.number.to_string()
+            "chain" => self.chain.to_string(),
         )
         .increment(1);
 

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "tycho-indexer-client"
 # this is versioned in lockstep with all other tycho packages
-version = "0.147.2"
+version = "0.153.1"
 description = "A package for interacting with the Tycho API."
 readme = "README.md"
 authors = [
@@ -34,7 +34,7 @@ testing = [
 ]
 
 [project.urls]
-homepage = "https://propellerswap.xyz"
+homepage = "https://propellerheads.xyz/"
 repository = "https://github.com/propeller-heads/tycho-indexer"
 
 [tool.setuptools.packages.find]

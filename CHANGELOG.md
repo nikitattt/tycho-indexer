@@ -1,3 +1,106 @@
+## [0.153.1](https://github.com/propeller-heads/tycho-indexer/compare/0.153.0...0.153.1) (2026-04-01)
+
+
+### Bug Fixes
+
+* resume from block number instead of cursor on cold restart ([7a4ce03](https://github.com/propeller-heads/tycho-indexer/commit/7a4ce0376e9df91bd16674fc7216275a19a356a0))
+* resume from block number instead of cursor on cold restart ([#893](https://github.com/propeller-heads/tycho-indexer/issues/893)) ([2aca9f2](https://github.com/propeller-heads/tycho-indexer/commit/2aca9f25a088a7af7bc34baebb5505229f16eb96))
+* return error instead of panicking on block fetch failure ([4754b1a](https://github.com/propeller-heads/tycho-indexer/commit/4754b1a5ad4ef735de8072b948bcb3d8ff09868f))
+
+## [0.153.0](https://github.com/propeller-heads/tycho-indexer/compare/0.152.4...0.153.0) (2026-04-01)
+
+
+### Features
+
+* add blocklist filter ([7e01876](https://github.com/propeller-heads/tycho-indexer/commit/7e01876af915946080a99e21d568ac943ebbcd65))
+* add blocklist filter ([#886](https://github.com/propeller-heads/tycho-indexer/issues/886)) ([93913cb](https://github.com/propeller-heads/tycho-indexer/commit/93913cb2a0e064e22b509abb8415e5ae770b3d41))
+* add cli blocklist option ([186daf1](https://github.com/propeller-heads/tycho-indexer/commit/186daf1e1adfce7adb77f339ac9dfacaab1c74c2))
+* **tycho-client:** use TOML as input for the blocklist-config CLI flag ([706a0ed](https://github.com/propeller-heads/tycho-indexer/commit/706a0ed9ea89ef395b813bd1348c3c90abed14c1))
+
+
+### Bug Fixes
+
+* do not update ComponentFilter with set Ids ([93ba9c1](https://github.com/propeller-heads/tycho-indexer/commit/93ba9c18af645a4e28a4844d22cacd72ebe2904f))
+
+## [0.152.4](https://github.com/propeller-heads/tycho-indexer/compare/0.152.3...0.152.4) (2026-03-25)
+
+## [0.152.3](https://github.com/propeller-heads/tycho-indexer/compare/0.152.2...0.152.3) (2026-03-23)
+
+
+### Bug Fixes
+
+* handle null storageKeys in eth_createAccessList response ([586ec92](https://github.com/propeller-heads/tycho-indexer/commit/586ec92e6e5726db0faf1662e44503004ffd0014))
+* handle null storageKeys in eth_createAccessList response ([#881](https://github.com/propeller-heads/tycho-indexer/issues/881)) ([689a285](https://github.com/propeller-heads/tycho-indexer/commit/689a2858ce0ce37c412bef12b5a22ee63cad8738))
+
+## [0.152.2](https://github.com/propeller-heads/tycho-indexer/compare/0.152.1...0.152.2) (2026-03-23)
+
+
+### Bug Fixes
+
+* resolve cargo audit vulnerabilities ([04fa9eb](https://github.com/propeller-heads/tycho-indexer/commit/04fa9ebebc1c5cc4b5669afa035f2e09748708b2))
+* resolve cargo audit vulnerabilities ([#883](https://github.com/propeller-heads/tycho-indexer/issues/883)) ([7a4fb8f](https://github.com/propeller-heads/tycho-indexer/commit/7a4fb8f6c500116087e664ae63ab3988594e00fe))
+
+## [0.152.1](https://github.com/propeller-heads/tycho-indexer/compare/0.152.0...0.152.1) (2026-03-20)
+
+
+### Bug Fixes
+
+* add reorg logs ([fb02bdc](https://github.com/propeller-heads/tycho-indexer/commit/fb02bdc33f8480fd62816201b5cdacd78b60ce92))
+
+## [0.152.0](https://github.com/propeller-heads/tycho-indexer/compare/0.151.0...0.152.0) (2026-03-19)
+
+
+### Features
+
+* add user_identity label to websocket subscriptions gauge ([4dd2537](https://github.com/propeller-heads/tycho-indexer/commit/4dd2537acb5377562b1a44044deca36b2473cbe9))
+
+
+### Bug Fixes
+
+* reduce metrics cardinality by removing UUID labels ([8c6c60c](https://github.com/propeller-heads/tycho-indexer/commit/8c6c60cf1f55e6194b0f449875e82a8a6b767384))
+
+## [0.151.0](https://github.com/propeller-heads/tycho-indexer/compare/0.150.0...0.151.0) (2026-03-19)
+
+
+### Features
+
+* add run-ci skill and nextest wrapper script ([aae965f](https://github.com/propeller-heads/tycho-indexer/commit/aae965f024509206f83ad114d3b8ab324286c573))
+
+
+### Bug Fixes
+
+* update Python client tests and DTOs for chain-in-body API ([03f1c3e](https://github.com/propeller-heads/tycho-indexer/commit/03f1c3e8c3ddab8615e794d25dcf625b93c7af1a))
+
+## [0.150.0](https://github.com/propeller-heads/tycho-indexer/compare/0.149.0...0.150.0) (2026-03-18)
+
+
+### Features
+
+* add max_retries option to CLI arguments for startup attempts ([2f8202c](https://github.com/propeller-heads/tycho-indexer/commit/2f8202cd465f92048036e5c86bdc228296737e94))
+* add max_retries option to CLI arguments for startup attempts ([#858](https://github.com/propeller-heads/tycho-indexer/issues/858)) ([3f1e33b](https://github.com/propeller-heads/tycho-indexer/commit/3f1e33b7e3e6999f2d9399481da33b43e7b8ee4d))
+
+## [0.149.0](https://github.com/propeller-heads/tycho-indexer/compare/0.148.0...0.149.0) (2026-03-16)
+
+
+### Features
+
+* add allow_historical plan restriction to reject historical RPC queries ([aa362cb](https://github.com/propeller-heads/tycho-indexer/commit/aa362cb329d38c9664f8e6b3978d561b369780de))
+* add allow_historical plan restriction to reject historical RPC queries ([#872](https://github.com/propeller-heads/tycho-indexer/issues/872)) ([82611a1](https://github.com/propeller-heads/tycho-indexer/commit/82611a11d5a079032a5d6e1d1f02350f2ad3a659))
+
+## [0.148.0](https://github.com/propeller-heads/tycho-indexer/compare/0.147.2...0.148.0) (2026-03-13)
+
+
+### Features
+
+* expose RPC batching config as CLI arguments ([00996e4](https://github.com/propeller-heads/tycho-indexer/commit/00996e43ddada753d49acd95f7ad3712fe93d837))
+* expose RPC batching config as CLI arguments ([#876](https://github.com/propeller-heads/tycho-indexer/issues/876)) ([78e7acb](https://github.com/propeller-heads/tycho-indexer/commit/78e7acba4169912462688489468713ea0c2f00a7))
+
+
+### Bug Fixes
+
+* make batching args optional, keep default client behavior ([ff7956c](https://github.com/propeller-heads/tycho-indexer/commit/ff7956c6d109b18303def95782d60ce2379f1e9d))
+* panic on startup if storage slot batch size is 0 ([363a406](https://github.com/propeller-heads/tycho-indexer/commit/363a406c2e190da2ccbdcaeaa921390757bc4943))
+
 ## [0.147.2](https://github.com/propeller-heads/tycho-indexer/compare/0.147.1...0.147.2) (2026-03-11)
 
 
