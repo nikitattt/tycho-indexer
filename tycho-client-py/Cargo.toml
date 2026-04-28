@@ -1,8 +1,0 @@
-[package]
-name = "tycho-client-cli"
-version = "0.30.0"
-edition = "2021"
-
-[dependencies]
-tycho-client.workspace = true
-tokio.workspace = true

@@ -1,0 +1,54 @@
+[package]
+name = "tycho-common"
+version.workspace = true
+edition.workspace = true
+description = "Contains shared models, traits and helpers used within the Tycho system"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+license.workspace = true
+categories.workspace = true
+readme = "README.md"
+rust-version = "1.87.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# TODO: eventually remove this dependency, currently used only by hex_bytes.
+serde.workspace = true
+diesel = { workspace = true, optional = true }
+thiserror.workspace = true
+hex.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+strum_macros.workspace = true
+uuid.workspace = true
+utoipa.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+typetag.workspace = true
+rand.workspace = true
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+bytes = "1.5.0"
+mockall = { workspace = true, optional = true }
+num-bigint = "0.4"
+deepsize.workspace = true# perf: make optional, as used only by the indexer for memory profiling
+itertools = "0.10.5"
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio.workspace = true
+diesel-async.workspace = true
+pretty_assertions.workspace = true
+rstest.workspace = true
+maplit = "1.0.2"
+
+[features]
+diesel = ["dep:diesel"]
+test-utils = ["mockall"]
+
+[package.metadata.cargo-machete]
+ignored = ["strum"]

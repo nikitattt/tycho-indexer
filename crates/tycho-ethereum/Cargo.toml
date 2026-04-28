@@ -1,0 +1,48 @@
+[package]
+name = "tycho-ethereum"
+version.workspace = true
+edition.workspace = true
+description = "Ethereum specific implementation of core tycho traits"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+license.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tycho-common.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+unicode-segmentation.workspace = true
+futures = "0.3"
+backoff = { version = "0.4.0", features = ["tokio"], default-features = false }
+num-bigint = { version = "0.4", features = ["serde"] }
+serde_with = "3.16.1"
+
+# Required dependencies
+alloy = { workspace = true, default-features = false, features = [
+    "reqwest-default-tls",
+    "rpc-client",
+    "json-rpc",
+    "sol-types",
+    "rpc-types",
+    "rpc-types-trace",
+    "rpc-types-debug",
+    "providers",
+] }
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+mockito.workspace = true
+rstest.workspace = true
+tracing-test = "0.2.5"
+
+[[example]]
+name = "run-analysis"

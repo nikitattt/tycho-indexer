@@ -1,6 +1,7 @@
-set -e 
+#!/usr/bin/env bash
+set -e
 
-cargo +nightly fmt -- --check
-cargo +nightly clippy --locked --all --all-features --all-targets -- -D warnings
-cargo nextest run --workspace --locked --all-targets --all-features --bin tycho-indexer -E 'not test(serial_db)'
-cargo nextest run --workspace --locked --all-targets --all-features --bin tycho-indexer -E 'test(serial_db)'
+cargo +nightly fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo nextest run --workspace --all-features -E 'not test(serial_db)'
+cargo nextest run --workspace --all-features -E 'test(serial_db)'
