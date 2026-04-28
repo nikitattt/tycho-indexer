@@ -3425,6 +3425,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "head-latency-probe"
+version = "0.153.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "futures-util",
+ "http 0.2.12",
+ "prost 0.11.9",
+ "prost-types 0.11.9",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tonic 0.9.2",
+]
+
+[[package]]
 name = "heck"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6864,8 +6881,11 @@ dependencies = [
  "futures-util",
  "log",
  "native-tls",
+ "rustls 0.21.12",
+ "rustls-native-certs 0.6.3",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls 0.24.1",
  "tungstenite",
 ]
 
@@ -7229,6 +7249,7 @@ dependencies = [
  "log",
  "native-tls",
  "rand 0.8.5",
+ "rustls 0.21.12",
  "sha1",
  "thiserror 1.0.69",
  "url",

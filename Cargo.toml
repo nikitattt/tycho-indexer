@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "head-latency-probe",
     "tycho-indexer",
     "tycho-client",
     "tycho-client-py",
