@@ -1,0 +1,12 @@
+[Unit]
+Description=Tycho TVL updater
+After=network-online.target postgresql.service tycho-indexer.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/tycho/tvl.env
+ExecStart=/usr/local/bin/tycho-tvl --run-mode incremental --cron-period-secs 300
+User=tycho
+Group=tycho
+RuntimeMaxSec=240

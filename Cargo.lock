@@ -9988,6 +9988,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tycho-tvl"
+version = "0.276.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "num-bigint",
+ "num-traits",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.20",
+ "tycho-client",
+ "tycho-common",
+ "tycho-simulation",
+ "tycho-storage",
+]
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

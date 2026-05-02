@@ -1,0 +1,30 @@
+[package]
+name = "tycho-tvl"
+version.workspace = true
+edition.workspace = true
+description = "Production sidecar for maintaining Tycho token prices and component TVL"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+license.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "tycho-tvl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+num-bigint.workspace = true
+num-traits.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+tycho-client.workspace = true
+tycho-common.workspace = true
+tycho-simulation = { workspace = true, features = ["evm"] }
+tycho-storage.workspace = true
