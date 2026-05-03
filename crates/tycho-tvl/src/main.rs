@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
+    time::{Duration as StdDuration, Instant},
 };
 
 mod db;
@@ -62,10 +63,14 @@ struct Cli {
     cron_period_secs: i64,
     #[arg(long, default_value_t = 2)]
     recent_window_multiplier: i64,
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 6)]
     max_rounds_initial: usize,
     #[arg(long, default_value_t = 4)]
     max_rounds_incremental: usize,
+    #[arg(long, default_value_t = 10.0)]
+    min_initial_update_bps: f64,
+    #[arg(long, default_value_t = 10.0)]
+    min_price_improvement_bps: f64,
     #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
     write_batch_size: usize,
     #[arg(long, default_value_t = DEFAULT_SNAPSHOT_BATCH_SIZE)]
@@ -194,6 +199,8 @@ async fn run(cli: Cli) -> Result<()> {
         recent_window_multiplier = cli.recent_window_multiplier,
         max_rounds_initial = cli.max_rounds_initial,
         max_rounds_incremental = cli.max_rounds_incremental,
+        min_initial_update_bps = cli.min_initial_update_bps,
+        min_price_improvement_bps = cli.min_price_improvement_bps,
         write_batch_size = cli.write_batch_size,
         snapshot_batch_size = cli.snapshot_batch_size,
         max_deviation_bps = cli.max_deviation_bps,
@@ -416,9 +423,11 @@ async fn run(cli: Cli) -> Result<()> {
             rejected_edges = stats.rejected_edges,
             "TychoTvlPricingRoundStarting"
         );
+        let known_prices_at_round_start = price_book.len();
         let round_prices = price_components(
             &storage,
             &tvl_db,
+            round,
             chain,
             latest_block,
             &cli.protocol_systems,
@@ -438,9 +447,21 @@ async fn run(cli: Cli) -> Result<()> {
             "TychoTvlPricingRoundCandidatesBuilt"
         );
 
-        let updates =
-            select_round_updates(round_prices, &price_book, &protected_tokens, &target_tokens);
-        info!(round, updates = updates.len(), "TychoTvlPricingRoundUpdatesSelected");
+        let updates = select_round_updates(
+            round_prices,
+            &price_book,
+            &protected_tokens,
+            &target_tokens,
+            cli.min_price_improvement_bps,
+        );
+        let update_rate_bps = update_rate_bps(updates.len(), known_prices_at_round_start);
+        info!(
+            round,
+            updates = updates.len(),
+            known_prices = known_prices_at_round_start,
+            update_rate_bps,
+            "TychoTvlPricingRoundUpdatesSelected"
+        );
         if updates.is_empty() {
             break;
         }
@@ -469,6 +490,19 @@ async fn run(cli: Cli) -> Result<()> {
             total_price_book = price_book.len(),
             "TychoTvlPricingRoundApplied"
         );
+
+        if matches!(cli.run_mode, RunMode::Initial)
+            && cli.min_initial_update_bps > 0.0
+            && update_rate_bps < cli.min_initial_update_bps
+        {
+            info!(
+                round,
+                update_rate_bps,
+                min_initial_update_bps = cli.min_initial_update_bps,
+                "TychoTvlInitialStopThresholdReached"
+            );
+            break;
+        }
     }
 
     // Convert solver output into rows for token_price.
@@ -813,6 +847,7 @@ async fn discover_component_tokens(
 async fn price_components(
     storage: &DirectGateway,
     tvl_db: &TvlDb,
+    round: usize,
     chain: Chain,
     latest_block: u64,
     protocol_systems: &[String],
@@ -824,10 +859,19 @@ async fn price_components(
     stats: &mut RunStats,
 ) -> Result<Vec<PriceCandidate>> {
     let mut candidates = Vec::new();
+    let batch_size = snapshot_batch_size.max(1);
+    let batches_per_protocol = component_ids.len().div_ceil(batch_size);
+    let total_batches = protocol_systems
+        .len()
+        .saturating_mul(batches_per_protocol);
+    let started_at = Instant::now();
+    let mut last_progress_at = started_at;
+    let mut processed_batches = 0usize;
+    let rejected_edges_at_start = stats.rejected_edges;
 
     for protocol_system in protocol_systems {
         for (batch_index, id_batch) in component_ids
-            .chunks(snapshot_batch_size.max(1))
+            .chunks(batch_size)
             .enumerate()
         {
             let load_ids = filter_component_ids_for_simulation(
@@ -839,6 +883,20 @@ async fn price_components(
             )
             .await?;
             if load_ids.is_empty() {
+                processed_batches += 1;
+                maybe_log_pricing_progress(
+                    round,
+                    protocol_system,
+                    batch_index,
+                    processed_batches,
+                    total_batches,
+                    candidates.len(),
+                    stats
+                        .rejected_edges
+                        .saturating_sub(rejected_edges_at_start),
+                    started_at,
+                    &mut last_progress_at,
+                );
                 continue;
             }
 
@@ -847,7 +905,7 @@ async fn price_components(
                 .map(String::as_str)
                 .collect::<Vec<_>>();
 
-            info!(
+            debug!(
                 protocol_system = %protocol_system,
                 batch_index,
                 batch_components = id_batch.len(),
@@ -868,17 +926,31 @@ async fn price_components(
             .into_iter()
             .map(ResponseProtocolComponent::from)
             .collect::<Vec<_>>();
-            info!(
+            debug!(
                 protocol_system = %protocol_system,
                 batch_index,
                 components = components.len(),
                 "TychoTvlPricingBatchComponentsLoaded"
             );
             if components.is_empty() {
+                processed_batches += 1;
+                maybe_log_pricing_progress(
+                    round,
+                    protocol_system,
+                    batch_index,
+                    processed_batches,
+                    total_batches,
+                    candidates.len(),
+                    stats
+                        .rejected_edges
+                        .saturating_sub(rejected_edges_at_start),
+                    started_at,
+                    &mut last_progress_at,
+                );
                 continue;
             }
 
-            info!(
+            debug!(
                 protocol_system = %protocol_system,
                 batch_index,
                 components = components.len(),
@@ -900,7 +972,7 @@ async fn price_components(
             .into_iter()
             .map(|state| (state.component_id.clone(), ResponseProtocolState::from(state)))
             .collect::<HashMap<_, _>>();
-            info!(
+            debug!(
                 protocol_system = %protocol_system,
                 batch_index,
                 states = states.len(),
@@ -927,7 +999,7 @@ async fn price_components(
                         })
                 })
                 .collect::<Vec<_>>();
-            info!(
+            debug!(
                 protocol_system = %protocol_system,
                 batch_index,
                 snapshots = snapshots.len(),
@@ -1007,7 +1079,7 @@ async fn price_components(
                     }
                 }
             }
-            info!(
+            debug!(
                 protocol_system = %protocol_system,
                 batch_index,
                 decoded_components,
@@ -1018,10 +1090,70 @@ async fn price_components(
                 decode_skip_reasons = %decode_skip_stats.summary(),
                 "TychoTvlPricingBatchComplete"
             );
+            processed_batches += 1;
+            maybe_log_pricing_progress(
+                round,
+                protocol_system,
+                batch_index,
+                processed_batches,
+                total_batches,
+                candidates.len(),
+                stats
+                    .rejected_edges
+                    .saturating_sub(rejected_edges_at_start),
+                started_at,
+                &mut last_progress_at,
+            );
         }
     }
 
     Ok(candidates)
+}
+
+fn update_rate_bps(updates: usize, known_prices: usize) -> f64 {
+    if known_prices == 0 {
+        return 0.0;
+    }
+    (updates as f64 / known_prices as f64) * 10_000.0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_log_pricing_progress(
+    round: usize,
+    protocol_system: &str,
+    batch_index: usize,
+    processed_batches: usize,
+    total_batches: usize,
+    total_candidates: usize,
+    rejected_edges: usize,
+    started_at: Instant,
+    last_progress_at: &mut Instant,
+) {
+    let now = Instant::now();
+    if processed_batches < total_batches
+        && now.duration_since(*last_progress_at) < StdDuration::from_secs(60)
+    {
+        return;
+    }
+
+    *last_progress_at = now;
+    let progress_pct = if total_batches == 0 {
+        100.0
+    } else {
+        processed_batches as f64 * 100.0 / total_batches as f64
+    };
+    info!(
+        round,
+        protocol_system,
+        batch_index,
+        processed_batches,
+        total_batches,
+        progress_pct,
+        elapsed_secs = now.duration_since(started_at).as_secs(),
+        total_candidates,
+        rejected_edges,
+        "TychoTvlPricingProgress"
+    );
 }
 
 async fn filter_component_ids_for_simulation(
@@ -1035,7 +1167,7 @@ async fn filter_component_ids_for_simulation(
         return Ok(component_ids.to_vec());
     }
 
-    info!(
+    debug!(
         protocol_system,
         batch_index,
         batch_components = component_ids.len(),
@@ -1050,7 +1182,7 @@ async fn filter_component_ids_for_simulation(
         )
         .await
         .context("failed to filter uniswap_v3 components by required state attributes")?;
-    info!(
+    debug!(
         protocol_system,
         batch_index,
         batch_components = component_ids.len(),
@@ -1348,6 +1480,13 @@ mod tests {
     fn weighted_median_ignores_invalid_values() {
         let values = [(0.0, 0.25), (42.0, 0.60), (50.0, 0.15)];
         assert_eq!(weighted_median(&values), Some(42.0));
+    }
+
+    #[test]
+    fn update_rate_is_reported_in_basis_points() {
+        assert_eq!(update_rate_bps(100, 10_000), 100.0);
+        assert_eq!(update_rate_bps(25, 50_000), 5.0);
+        assert_eq!(update_rate_bps(1, 0), 0.0);
     }
 
     #[test]

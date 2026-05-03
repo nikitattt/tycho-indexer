@@ -59,8 +59,10 @@ All CLI flags:
 | `--protocol-systems <csv>` | | `uniswap_v2,uniswap_v3` | Comma-separated protocol systems to price and refresh TVL for. |
 | `--cron-period-secs <secs>` | | `300` | Expected timer period for incremental mode. |
 | `--recent-window-multiplier <n>` | | `2` | Incremental changed-component window is `cron_period_secs * recent_window_multiplier`. |
-| `--max-rounds-initial <n>` | | `64` | Maximum solver relaxation rounds in initial mode. |
+| `--max-rounds-initial <n>` | | `6` | Maximum solver relaxation rounds in initial mode. |
 | `--max-rounds-incremental <n>` | | `4` | Maximum graph expansion and solver rounds in incremental mode. |
+| `--min-initial-update-bps <bps>` | | `10` | Stops initial mode after applying a round when `updates / known_prices` at round start is below this value. Use `0` to disable this early stop. |
+| `--min-price-improvement-bps <bps>` | | `10` | Existing token prices are replaced only when the native price changes by at least this amount. First-time prices are always accepted. Use `0` to disable this filter. |
 | `--write-batch-size <n>` | | `5000` | Batch size for token price writes and component TVL refreshes. |
 | `--snapshot-batch-size <n>` | | `500` | Batch size for DB component/state loading and simulation batches. |
 | `--max-deviation-bps <bps>` | | `300` | Rejects a pool edge when probe prices deviate too much. |
@@ -90,6 +92,10 @@ Initial mode:
 - starts from hard native-token anchors such as Base WETH;
 - repeatedly prices the full loaded pool graph until no better prices appear or
   `--max-rounds-initial` is reached;
+- ignores tiny replacement prices below `--min-price-improvement-bps`, while
+  still accepting first-time token prices;
+- stops early after applying a low-yield round when
+  `updates / known_prices < --min-initial-update-bps`;
 - writes hard anchors and prices discovered in the current run;
 - refreshes `component_tvl` for all scoped components in batches.
 
@@ -112,6 +118,32 @@ target/release/tycho-tvl \
   --chain base \
   --write-batch-size 1000
 ```
+
+For very large chains, the important runtime controls are:
+
+```bash
+target/release/tycho-tvl \
+  --run-mode initial \
+  --chain base \
+  --max-rounds-initial 6 \
+  --min-initial-update-bps 10 \
+  --min-price-improvement-bps 10
+```
+
+`--max-rounds-initial` is the hard cap. `--min-initial-update-bps` is the
+marginal-yield stop: after each round is applied, the process compares the
+number of accepted updates with the number of known prices at the start of that
+round. For example, `10` means stop once a round adds less than `0.10%` new
+prices. This still writes the prices from the low-yield round before stopping.
+
+Set `--min-initial-update-bps 0` if you want the job to run exactly until
+`--max-rounds-initial` or until a round finds no updates.
+
+`--min-price-improvement-bps` controls solver churn. A token that does not have
+a price yet is always accepted. A token that already has a price is replaced
+only when the new native-denominated price differs enough from the current
+price. This makes later rounds converge faster when they are only finding tiny
+route-level changes.
 
 ### Incremental
 
@@ -229,6 +261,28 @@ Each edge contributes its probe deviation to the score. Lower score wins; ties
 prefer fewer hops, then lower final-edge deviation.
 
 Hard native-token anchors are protected from being repriced by pools.
+
+## Logging
+
+Use `RUST_LOG=info` for normal production runs. At this level, `tycho-tvl` logs:
+
+- run configuration and database load milestones;
+- graph size and target token counts;
+- pricing round start, candidate counts, selected updates, and applied totals;
+- one `TychoTvlPricingProgress` line roughly every minute during large pricing
+  scans, including `progress_pct`, processed batches, candidates, rejected
+  edges, and elapsed seconds;
+- final write and TVL refresh summaries.
+
+Per-batch component/state load details are `DEBUG` logs. Enable them only when
+debugging a specific decode or simulation issue:
+
+```bash
+RUST_LOG=tycho_tvl=debug,info target/release/tycho-tvl ...
+```
+
+`TRACE` logs include individual skipped decode records and are too noisy for
+normal initial runs.
 
 ## TVL Update
 

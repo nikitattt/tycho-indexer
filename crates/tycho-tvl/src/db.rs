@@ -145,7 +145,10 @@ WHERE c.name = $1
         .await
         .with_context(|| format!("failed to load recently changed components for {chain}"))?;
 
-        Ok(rows.into_iter().map(|row| row.external_id).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| row.external_id)
+            .collect())
     }
 
     pub async fn get_components_for_tokens_limited(
@@ -159,7 +162,10 @@ WHERE c.name = $1
             return Ok(Vec::new());
         }
 
-        let addresses = token_addresses.iter().map(Bytes::to_vec).collect::<Vec<_>>();
+        let addresses = token_addresses
+            .iter()
+            .map(Bytes::to_vec)
+            .collect::<Vec<_>>();
         let mut conn = self.connection().await?;
         let rows = sql_query(
             r#"
@@ -207,7 +213,10 @@ WHERE component_rank <= $4
         .await
         .with_context(|| format!("failed to load limited token components for {chain}"))?;
 
-        Ok(rows.into_iter().map(|row| row.external_id).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| row.external_id)
+            .collect())
     }
 
     pub async fn filter_components_with_state_requirements(
@@ -278,7 +287,10 @@ AND NOT EXISTS (
         .await
         .with_context(|| format!("failed to filter component state requirements for {chain}"))?;
 
-        Ok(rows.into_iter().map(|row| row.external_id).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| row.external_id)
+            .collect())
     }
 
     pub async fn get_components_for_protocols(
@@ -308,7 +320,10 @@ WHERE c.name = $1
         .await
         .with_context(|| format!("failed to load scoped components for {chain}"))?;
 
-        Ok(rows.into_iter().map(|row| row.external_id).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| row.external_id)
+            .collect())
     }
 
     pub async fn upsert_token_prices_by_address(
@@ -330,8 +345,14 @@ WHERE c.name = $1
         let mut conn = self.connection().await?;
         let mut affected = 0usize;
         for chunk in rows.chunks(batch_size.max(1)) {
-            let addresses = chunk.iter().map(|(address, _)| address.clone()).collect::<Vec<_>>();
-            let prices = chunk.iter().map(|(_, price)| *price).collect::<Vec<_>>();
+            let addresses = chunk
+                .iter()
+                .map(|(address, _)| address.clone())
+                .collect::<Vec<_>>();
+            let prices = chunk
+                .iter()
+                .map(|(_, price)| *price)
+                .collect::<Vec<_>>();
             let count = sql_query(
                 r#"
 WITH input_price AS (
@@ -380,7 +401,10 @@ DO UPDATE SET price = EXCLUDED.price
 
         let component_batches: Vec<Option<&[String]>> = match component_ids {
             Some(ids) if ids.is_empty() => return Ok(0),
-            Some(ids) => ids.chunks(batch_size.max(1)).map(Some).collect(),
+            Some(ids) => ids
+                .chunks(batch_size.max(1))
+                .map(Some)
+                .collect(),
             None => vec![None],
         };
 
