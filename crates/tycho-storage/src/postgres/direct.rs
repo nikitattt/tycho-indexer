@@ -50,16 +50,6 @@ impl DirectGateway {
         DirectGateway { pool, state_gateway, chain }
     }
 
-    // These accessors are intentionally crate-private. They let isolated storage extension modules
-    // such as `postgres::tvl` reuse the existing DB pool and PostgresGateway internals without
-    // moving sidecar-specific SQL into this file or making the fields directly visible.
-    pub(crate) fn pool(&self) -> &Pool<AsyncPgConnection> {
-        &self.pool
-    }
-    pub(crate) fn state_gateway(&self) -> &PostgresGateway {
-        &self.state_gateway
-    }
-
     pub async fn get_delta(
         &self,
         chain: &Chain,

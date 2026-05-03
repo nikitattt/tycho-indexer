@@ -19,6 +19,8 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
+diesel.workspace = true
+diesel-async.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
 tokio.workspace = true

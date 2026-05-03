@@ -13,6 +13,8 @@ Before running `tycho-tvl`, the indexer database must be available:
 - `DATABASE_URL` must point at the same Postgres database used by `tycho-indexer`.
 - The indexer must already have protocol components, component balances, tokens,
   and latest block data for the selected chain.
+- Database migrations must already be applied. `tycho-tvl` opens the existing
+  database directly and does not run migrations or initialize enum rows.
 - Supported simulation protocols are currently `uniswap_v2` and `uniswap_v3`.
 
 There is no built-in default for `DATABASE_URL`. Pass it explicitly or set it
@@ -56,12 +58,15 @@ All CLI flags:
 | `--database-url <url>` | `DATABASE_URL` | required | Postgres database used by the indexer. |
 | `--protocol-systems <csv>` | | `uniswap_v2,uniswap_v3` | Comma-separated protocol systems to price and refresh TVL for. |
 | `--cron-period-secs <secs>` | | `300` | Expected timer period for incremental mode. |
-| `--recent-window-multiplier <n>` | | `2` | Incremental recent-token window is `cron_period_secs * recent_window_multiplier`. |
+| `--recent-window-multiplier <n>` | | `2` | Incremental changed-component window is `cron_period_secs * recent_window_multiplier`. |
 | `--max-rounds-initial <n>` | | `64` | Maximum solver relaxation rounds in initial mode. |
 | `--max-rounds-incremental <n>` | | `4` | Maximum graph expansion and solver rounds in incremental mode. |
 | `--write-batch-size <n>` | | `5000` | Batch size for token price writes and component TVL refreshes. |
 | `--snapshot-batch-size <n>` | | `500` | Batch size for DB component/state loading and simulation batches. |
 | `--max-deviation-bps <bps>` | | `300` | Rejects a pool edge when probe prices deviate too much. |
+| `--max-incremental-intermediate-tokens <n>` | | `60` | Maximum unpriced frontier tokens expanded per incremental graph round. |
+| `--max-incremental-components-per-token <n>` | | `25` | Maximum candidate pools loaded for each frontier token during incremental graph expansion. |
+| `--max-incremental-graph-components <n>` | | `25000` | Maximum total component count used for incremental route-expansion context. Recently changed components are always included. |
 | `--dry-run` | | `false` | Computes prices and TVL scope, logs stats, and writes nothing. |
 
 ## Run Modes
@@ -124,16 +129,20 @@ target/release/tycho-tvl \
 Incremental mode:
 
 - computes `recent_threshold = now() - cron_period_secs * recent_window_multiplier`;
-- selects recently traded tokens through the existing `/v1/tokens` storage path,
-  using `component_balance_default.valid_from`;
+- selects recently changed components directly from
+  `component_balance_default.valid_from`;
+- discovers target tokens from those changed components;
 - loads old DB prices as seed context, but does not automatically rewrite them;
-- expands the token-pool-token graph outward from recently traded tokens for
-  `--max-rounds-incremental`;
+- expands a bounded token-pool-token candidate graph for
+  `--max-rounds-incremental`, capped by
+  `--max-incremental-intermediate-tokens`,
+  `--max-incremental-components-per-token`, and
+  `--max-incremental-graph-components`;
 - can price a target through a newly discovered intermediate route, for example
   `WETH -> token2 -> target`;
 - writes only prices refreshed or discovered by the current run inside the
   incremental graph;
-- refreshes TVL only for components directly affected by recently traded tokens.
+- refreshes TVL only for components whose balances changed in the recent window.
 
 If the timer runs every five minutes, the default settings inspect roughly the
 last ten minutes of balance changes:
@@ -170,6 +179,12 @@ Each candidate pool edge is simulated with three native-value probe sizes:
 0.00001 native
 ```
 
+For each successful forward probe, the raw implied price is:
+
+```text
+forward_native_per_token = probe_native_value / output_whole_token
+```
+
 The edge price is selected with a weighted median:
 
 ```text
@@ -178,8 +193,35 @@ The edge price is selected with a weighted median:
 0.00001 native  weight 0.15
 ```
 
-An edge is rejected when fewer than two probes succeed or when probe deviation
-exceeds `--max-deviation-bps`.
+The weighted median is used as the center price. Probes whose implied prices are
+farther than `--max-deviation-bps` from that center are treated as outliers. An
+edge is accepted only when at least two inlier probes remain and the remaining
+probe weight is at least `0.60`.
+
+This means a large `1.0 native` probe can show heavy price impact without
+discarding the pool, as long as the smaller probes still agree. The slipped
+large trade is liquidity information, not the reusable token price.
+
+After a forward edge is accepted, `tycho-tvl` also checks sell-side recovery for
+fee-on-transfer and asymmetric-tax tokens. For every accepted forward probe it
+simulates selling the received output token amount back into the priced input
+token:
+
+```text
+recovered_native = recovered_input_whole_token * input_native_per_token
+sell_side_native_per_token = recovered_native / output_whole_token
+```
+
+If the sell-side probes are stable under the same inlier rules, the stored edge
+price is:
+
+```text
+min(forward_native_per_token, sell_side_native_per_token)
+```
+
+So transfer tax lowers the estimated token value when it is consistently visible
+in executable reverse quotes, but unstable large-trade slippage is not averaged
+into the global token price.
 
 The graph solver does not take the first available pool price. It evaluates all
 candidate routes in the loaded graph and keeps the lowest cumulative path score.
@@ -289,6 +331,8 @@ sudo -u tycho \
 
 - Run `initial` before relying on `tvl_gt` filters on a fresh database.
 - Run `incremental` every five minutes after the initial bootstrap.
+- Run database migrations with the normal indexer deployment path before starting
+  `tycho-tvl`; the sidecar intentionally skips migrations on startup.
 - If `--dry-run` reports zero prices, verify that the selected chain has WETH
   anchor token metadata, component balances, and supported protocol components.
 - If `component_tvl` remains empty, verify `token_price` has rows and that token

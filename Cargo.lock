@@ -9994,6 +9994,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "diesel",
+ "diesel-async",
  "num-bigint",
  "num-traits",
  "tokio",

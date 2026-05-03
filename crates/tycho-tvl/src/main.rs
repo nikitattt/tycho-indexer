@@ -3,6 +3,7 @@ use std::{
     str::FromStr,
 };
 
+mod db;
 mod pricing;
 
 use anyhow::{bail, Context, Result};
@@ -10,7 +11,7 @@ use chrono::Duration as ChronoDuration;
 use clap::{Parser, ValueEnum};
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use tracing_subscriber::EnvFilter;
 use tycho_client::feed::{synchronizer::ComponentWithState, BlockHeader};
 use tycho_common::{
@@ -24,8 +25,9 @@ use tycho_simulation::{
     evm::protocol::{uniswap_v2::state::UniswapV2State, uniswap_v3::state::UniswapV3State},
     protocol::models::{DecoderContext, TryFromWithBlock},
 };
-use tycho_storage::postgres::{builder::GatewayBuilder, direct::DirectGateway, tvl::TvlGatewayExt};
+use tycho_storage::postgres::{builder::GatewayBuilder, direct::DirectGateway};
 
+use crate::db::TvlDb;
 use crate::pricing::{
     apply_updates, select_round_updates, should_write_price, PriceCandidate, PriceState,
     PriceWriteMode,
@@ -34,6 +36,10 @@ use crate::pricing::{
 const DEFAULT_BATCH_SIZE: usize = 5_000;
 const DEFAULT_SNAPSHOT_BATCH_SIZE: usize = 500;
 const DEFAULT_DEVIATION_BPS: f64 = 300.0;
+const DEFAULT_MAX_INCREMENTAL_INTERMEDIATE_TOKENS: usize = 60;
+const DEFAULT_MAX_INCREMENTAL_COMPONENTS_PER_TOKEN: i64 = 25;
+const DEFAULT_MAX_INCREMENTAL_GRAPH_COMPONENTS: usize = 25_000;
+const MIN_EDGE_INLIER_WEIGHT: f64 = 0.60;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum RunMode {
@@ -66,6 +72,12 @@ struct Cli {
     snapshot_batch_size: usize,
     #[arg(long, default_value_t = DEFAULT_DEVIATION_BPS)]
     max_deviation_bps: f64,
+    #[arg(long, default_value_t = DEFAULT_MAX_INCREMENTAL_INTERMEDIATE_TOKENS)]
+    max_incremental_intermediate_tokens: usize,
+    #[arg(long, default_value_t = DEFAULT_MAX_INCREMENTAL_COMPONENTS_PER_TOKEN)]
+    max_incremental_components_per_token: i64,
+    #[arg(long, default_value_t = DEFAULT_MAX_INCREMENTAL_GRAPH_COMPONENTS)]
+    max_incremental_graph_components: usize,
     #[arg(long)]
     dry_run: bool,
 }
@@ -84,6 +96,86 @@ struct RunStats {
     rejected_edges: usize,
 }
 
+#[derive(Debug, Default)]
+struct DecodeSkipStats {
+    by_reason: HashMap<String, usize>,
+}
+
+impl DecodeSkipStats {
+    fn record(&mut self, err: &anyhow::Error) {
+        *self
+            .by_reason
+            .entry(err.to_string())
+            .or_default() += 1;
+    }
+
+    fn summary(&self) -> String {
+        let mut reasons = self
+            .by_reason
+            .iter()
+            .map(|(reason, count)| (reason.as_str(), *count))
+            .collect::<Vec<_>>();
+        reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        reasons
+            .into_iter()
+            .map(|(reason, count)| format!("{reason}: {count}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProbeQuote {
+    output_raw: BigUint,
+    output_whole: f64,
+    native_per_token: f64,
+    weight: f64,
+}
+
+#[derive(Debug, Default)]
+struct TargetCoverage {
+    total: usize,
+    priced: usize,
+    seed_priced: usize,
+    derived_priced: usize,
+    writable: usize,
+    unpriced: usize,
+    unpriced_samples: Vec<String>,
+}
+
+fn target_coverage(
+    target_tokens: &HashSet<Bytes>,
+    price_book: &HashMap<Bytes, PriceState>,
+    db_prices: &HashMap<Bytes, f64>,
+) -> TargetCoverage {
+    let mut coverage = TargetCoverage { total: target_tokens.len(), ..TargetCoverage::default() };
+
+    let mut unpriced_samples = Vec::new();
+    for token in target_tokens {
+        match price_book.get(token) {
+            Some(state) => {
+                coverage.priced += 1;
+                if state.is_seed {
+                    coverage.seed_priced += 1;
+                } else {
+                    coverage.derived_priced += 1;
+                }
+            }
+            None => {
+                coverage.unpriced += 1;
+                if unpriced_samples.len() < 10 {
+                    unpriced_samples.push(token.to_string());
+                }
+            }
+        }
+        if db_prices.contains_key(token) {
+            coverage.writable += 1;
+        }
+    }
+    coverage.unpriced_samples = unpriced_samples;
+    coverage
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -94,32 +186,60 @@ async fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     let chain =
         Chain::from_str(&cli.chain).with_context(|| format!("Unsupported chain {}", cli.chain))?;
+    info!(
+        run_mode = ?cli.run_mode,
+        chain = %chain,
+        protocol_systems = ?cli.protocol_systems,
+        cron_period_secs = cli.cron_period_secs,
+        recent_window_multiplier = cli.recent_window_multiplier,
+        max_rounds_initial = cli.max_rounds_initial,
+        max_rounds_incremental = cli.max_rounds_incremental,
+        write_batch_size = cli.write_batch_size,
+        snapshot_batch_size = cli.snapshot_batch_size,
+        max_deviation_bps = cli.max_deviation_bps,
+        max_incremental_intermediate_tokens = cli.max_incremental_intermediate_tokens,
+        max_incremental_components_per_token = cli.max_incremental_components_per_token,
+        max_incremental_graph_components = cli.max_incremental_graph_components,
+        dry_run = cli.dry_run,
+        "TychoTvlRunStarting"
+    );
+
+    info!("TychoTvlOpeningDatabaseGateway");
     let storage = GatewayBuilder::new(&cli.database_url)
         .set_chains(&[chain])
         .build_direct_gw()
         .await
         .context("failed to build direct storage gateway")?;
+    let tvl_db = TvlDb::connect(&cli.database_url)?;
+    info!("TychoTvlDatabaseGatewayReady");
 
-    let latest_block = storage
+    info!("TychoTvlLoadingLatestBlock");
+    let latest_block = tvl_db
         .get_latest_block_number(&chain)
         .await
         .context("failed to load latest indexed block")?;
+    info!(latest_block, "TychoTvlLatestBlockLoaded");
 
+    info!("TychoTvlLoadingTokens");
     let all_tokens =
         ProtocolGateway::get_tokens(&storage, chain, None, QualityRange::None(), None, None)
             .await
             .context("failed to load tokens")?
             .entity;
+    info!(tokens = all_tokens.len(), "TychoTvlTokensLoaded");
+
     let all_tokens_by_address = all_tokens
         .iter()
         .cloned()
         .map(|t| (t.address.clone(), t))
         .collect::<HashMap<_, _>>();
 
-    let existing_db_prices = storage
+    info!("TychoTvlLoadingExistingTokenPrices");
+    let existing_db_prices = tvl_db
         .get_existing_token_prices_for_chain(&chain)
         .await
         .context("failed to load existing token prices")?;
+    info!(prices = existing_db_prices.len(), "TychoTvlExistingTokenPricesLoaded");
 
     let mut stats = RunStats {
         tokens_loaded: all_tokens.len(),
@@ -128,35 +248,52 @@ async fn run(cli: Cli) -> Result<()> {
     };
 
     let hard_anchors = hard_anchors(&chain);
+    let mut incremental_affected_component_ids = HashSet::new();
     let target_tokens = match cli.run_mode {
         RunMode::Initial => all_tokens_by_address
             .keys()
             .cloned()
             .collect::<HashSet<_>>(),
         RunMode::Incremental => {
-            let now = storage
+            info!("TychoTvlLoadingDbTimestamp");
+            let now = tvl_db
                 .get_current_db_timestamp()
                 .await
                 .context("failed to get DB timestamp")?;
             let window_secs = cli.cron_period_secs * cli.recent_window_multiplier;
             let since = now - ChronoDuration::seconds(window_secs);
-            ProtocolGateway::get_tokens(
+            info!(
+                now = %now,
+                since = %since,
+                window_secs,
+                "TychoTvlLoadingRecentlyChangedComponents"
+            );
+            let changed_component_ids = tvl_db
+                .get_recently_changed_components(&chain, &cli.protocol_systems, since)
+                .await
+                .context("failed to load recently changed components")?;
+            info!(
+                components = changed_component_ids.len(),
+                "TychoTvlRecentlyChangedComponentsLoaded"
+            );
+
+            let changed_tokens = discover_component_tokens(
                 &storage,
                 chain,
-                None,
-                QualityRange::None(),
-                Some(since),
-                None,
+                &cli.protocol_systems,
+                &changed_component_ids,
+                cli.snapshot_batch_size,
             )
             .await
-            .context("failed to load recently traded tokens")?
-            .entity
-            .into_iter()
-            .map(|t| t.address)
-            .collect()
+            .context("failed to load tokens from recently changed components")?;
+            incremental_affected_component_ids = changed_component_ids
+                .into_iter()
+                .collect();
+            changed_tokens
         }
     };
     stats.target_tokens = target_tokens.len();
+    info!(target_tokens = target_tokens.len(), "TychoTvlTargetTokensSelected");
 
     let protected_tokens = hard_anchors
         .keys()
@@ -178,6 +315,10 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
     }
+    let seed_tokens = price_book
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
 
     let max_rounds = match cli.run_mode {
         RunMode::Initial => cli.max_rounds_initial,
@@ -191,21 +332,28 @@ async fn run(cli: Cli) -> Result<()> {
     // That is intentionally expensive, but it is the mode that should maximize coverage after a
     // fresh indexer boot or after importing stale seed prices.
     //
-    // Incremental mode starts from tokens whose balances changed recently. It still expands the
-    // token-pool-token graph outward for a few rounds, because a changed target token may only be
-    // priceable through an intermediate token that also has to be discovered during this run:
+    // Incremental mode starts from components whose balances changed recently, then discovers the
+    // tokens inside those changed pools. This is important: starting from recently changed tokens
+    // and asking for every pool containing those tokens makes hub assets such as WETH expand into
+    // most of the chain. The route graph can still expand outward, but only with explicit per-token
+    // and total graph caps.
     //
-    //     WETH -> intermediate token -> recently traded target token
+    // A changed target token may only be priceable through an intermediate token that also has to
+    // be discovered during this run:
+    //
+    //     WETH -> intermediate token -> token in a recently changed component
     //
     // The expanded graph is used for pricing context, but TVL refresh is kept scoped to components
-    // that directly contain recently traded tokens. That avoids rewriting unrelated component_tvl
-    // rows just because an intermediate token was needed to solve a route.
+    // whose balances changed in the recent window. That avoids rewriting unrelated component_tvl
+    // rows just because a token also appears in those unrelated components.
     let graph_scope = match cli.run_mode {
         RunMode::Initial => {
-            let component_ids = storage
+            info!("TychoTvlLoadingInitialComponentGraph");
+            let component_ids = tvl_db
                 .get_components_for_protocols(&chain, &cli.protocol_systems)
                 .await
                 .context("failed to load scoped components")?;
+            info!(components = component_ids.len(), "TychoTvlInitialComponentGraphLoaded");
             ComponentGraphScope {
                 component_ids: component_ids.iter().cloned().collect(),
                 affected_component_ids: component_ids.into_iter().collect(),
@@ -214,11 +362,17 @@ async fn run(cli: Cli) -> Result<()> {
         }
         RunMode::Incremental => build_incremental_graph_scope(
             &storage,
+            &tvl_db,
             chain,
             &cli.protocol_systems,
+            incremental_affected_component_ids,
             &target_tokens,
+            &seed_tokens,
             max_rounds,
             cli.snapshot_batch_size,
+            cli.max_incremental_intermediate_tokens,
+            cli.max_incremental_components_per_token,
+            cli.max_incremental_graph_components,
         )
         .await
         .context("failed to build incremental component graph")?,
@@ -230,6 +384,12 @@ async fn run(cli: Cli) -> Result<()> {
         .iter()
         .cloned()
         .collect::<Vec<_>>();
+    info!(
+        components = component_ids.len(),
+        graph_tokens = graph_scope.graph_tokens.len(),
+        affected_components = graph_scope.affected_component_ids.len(),
+        "TychoTvlGraphScopeReady"
+    );
 
     // Repeatedly price the loaded graph from the current price book.
     //
@@ -249,8 +409,16 @@ async fn run(cli: Cli) -> Result<()> {
             break;
         }
 
+        info!(
+            round,
+            components = component_ids.len(),
+            known_prices = price_book.len(),
+            rejected_edges = stats.rejected_edges,
+            "TychoTvlPricingRoundStarting"
+        );
         let round_prices = price_components(
             &storage,
+            &tvl_db,
             chain,
             latest_block,
             &cli.protocol_systems,
@@ -263,9 +431,16 @@ async fn run(cli: Cli) -> Result<()> {
         )
         .await
         .with_context(|| format!("failed to price component graph in round {round}"))?;
+        info!(
+            round,
+            candidates = round_prices.len(),
+            rejected_edges = stats.rejected_edges,
+            "TychoTvlPricingRoundCandidatesBuilt"
+        );
 
         let updates =
             select_round_updates(round_prices, &price_book, &protected_tokens, &target_tokens);
+        info!(round, updates = updates.len(), "TychoTvlPricingRoundUpdatesSelected");
         if updates.is_empty() {
             break;
         }
@@ -288,6 +463,12 @@ async fn run(cli: Cli) -> Result<()> {
             .values()
             .filter(|state| !state.is_seed)
             .count();
+        info!(
+            round,
+            derived_prices = stats.prices_computed,
+            total_price_book = price_book.len(),
+            "TychoTvlPricingRoundApplied"
+        );
     }
 
     // Convert solver output into rows for token_price.
@@ -321,24 +502,44 @@ async fn run(cli: Cli) -> Result<()> {
                 })
         })
         .collect::<HashMap<_, _>>();
+    info!(
+        prices_ready = db_prices.len(),
+        derived_prices = stats.prices_computed,
+        "TychoTvlDbPricesPrepared"
+    );
+    let coverage = target_coverage(&target_tokens, &price_book, &db_prices);
+    info!(
+        total = coverage.total,
+        priced = coverage.priced,
+        seed_priced = coverage.seed_priced,
+        derived_priced = coverage.derived_priced,
+        writable = coverage.writable,
+        unpriced = coverage.unpriced,
+        unpriced_samples = ?coverage.unpriced_samples,
+        "TychoTvlTargetPriceCoverage"
+    );
 
     if cli.dry_run {
         info!(?stats, prices_ready = db_prices.len(), "TychoTvlDryRunComplete");
         return Ok(());
     }
 
-    stats.prices_written = storage
+    info!(prices = db_prices.len(), "TychoTvlWritingTokenPrices");
+    stats.prices_written = tvl_db
         .upsert_token_prices_by_address(&chain, &db_prices, cli.write_batch_size)
         .await?;
+    info!(prices_written = stats.prices_written, "TychoTvlTokenPricesWritten");
 
     let affected = graph_scope
         .affected_component_ids
         .into_iter()
         .collect::<Vec<_>>();
-    stats.tvl_updated = storage
+    info!(components = affected.len(), "TychoTvlRefreshingComponentTvl");
+    stats.tvl_updated = tvl_db
         .refresh_component_tvl(&chain, &cli.protocol_systems, Some(&affected), cli.write_batch_size)
         .await
         .context("failed to refresh component TVL")?;
+    info!(components_updated = stats.tvl_updated, "TychoTvlComponentTvlRefreshed");
 
     info!(?stats, "TychoTvlRunComplete");
     Ok(())
@@ -356,54 +557,114 @@ struct ComponentGraphScope {
 
 async fn build_incremental_graph_scope(
     storage: &DirectGateway,
+    tvl_db: &TvlDb,
     chain: Chain,
     protocol_systems: &[String],
+    affected_component_ids: HashSet<String>,
     target_tokens: &HashSet<Bytes>,
+    seed_tokens: &HashSet<Bytes>,
     max_expansion_rounds: usize,
     batch_size: usize,
+    max_intermediate_tokens: usize,
+    max_components_per_token: i64,
+    max_graph_components: usize,
 ) -> Result<ComponentGraphScope> {
-    // Components directly containing recently traded tokens are the only rows whose TVL can become
-    // stale because of the incremental trigger. Keep this set separate from the expanded pricing
-    // graph: expansion may pull in unrelated pools only to discover intermediate token prices.
-    let target_token_vec = target_tokens
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    let affected_component_ids = storage
-        .get_components_for_tokens(&chain, protocol_systems, &target_token_vec)
-        .await
-        .context("failed to load affected components for incremental TVL refresh")?
-        .into_iter()
-        .collect::<HashSet<_>>();
+    info!(
+        target_tokens = target_tokens.len(),
+        affected_components = affected_component_ids.len(),
+        seed_tokens = seed_tokens.len(),
+        max_expansion_rounds,
+        batch_size,
+        max_intermediate_tokens,
+        max_components_per_token,
+        max_graph_components,
+        "TychoTvlIncrementalGraphBuildStarting"
+    );
 
-    let mut component_ids = HashSet::new();
+    // Components whose balances changed are the only rows whose TVL can become stale because of
+    // the incremental trigger. Keep this set separate from route-expansion components: expansion
+    // may pull in unrelated pools only to discover intermediate token prices.
+    let mut component_ids = affected_component_ids.clone();
     let mut seen_tokens = target_tokens.clone();
-    let mut frontier = target_tokens.clone();
+    let (mut frontier, capped_initial_frontier_tokens) = limit_token_set(
+        target_tokens
+            .iter()
+            .filter(|token| !seed_tokens.contains(*token))
+            .cloned()
+            .collect(),
+        max_intermediate_tokens,
+    );
+    info!(
+        initial_frontier_tokens = frontier.len(),
+        capped_initial_frontier_tokens,
+        initial_components = component_ids.len(),
+        "TychoTvlIncrementalGraphSeeded"
+    );
 
     // Expand token -> component -> token for a bounded number of rounds. This phase does not price
-    // anything; it only decides which pool states are useful context for the solver. The bound is
-    // important for the systemd timer path because otherwise one recently traded token connected to
-    // a popular asset could expand into most of the chain.
+    // anything; it only decides which pool states are useful context for the solver. Unlike a
+    // normal BFS, every frontier token is capped to a small number of candidate pools, ordered by
+    // existing TVL where available. This mirrors the production route-search approach: find a
+    // bounded candidate graph, then let simulation/ranking choose the best executable prices.
     for round in 0..max_expansion_rounds {
         if frontier.is_empty() {
             break;
         }
+        if component_ids.len() >= max_graph_components {
+            info!(
+                round,
+                components = component_ids.len(),
+                max_graph_components,
+                "TychoTvlGraphExpansionSkippedAtComponentCap"
+            );
+            break;
+        }
 
+        info!(
+            round,
+            frontier_tokens = frontier.len(),
+            seen_tokens = seen_tokens.len(),
+            known_components = component_ids.len(),
+            "TychoTvlGraphExpansionRoundStarting"
+        );
         let frontier_vec = frontier
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let round_components = storage
-            .get_components_for_tokens(&chain, protocol_systems, &frontier_vec)
+        let round_components = tvl_db
+            .get_components_for_tokens_limited(
+                &chain,
+                protocol_systems,
+                &frontier_vec,
+                max_components_per_token,
+            )
             .await
             .with_context(|| {
                 format!("failed to load graph components for expansion round {round}")
             })?;
+        info!(round, components = round_components.len(), "TychoTvlGraphExpansionComponentsLoaded");
 
-        let new_component_ids = round_components
+        let mut new_component_ids = round_components
             .into_iter()
-            .filter(|id| component_ids.insert(id.clone()))
+            .filter(|id| !component_ids.contains(id))
             .collect::<Vec<_>>();
+        let remaining_component_capacity = max_graph_components.saturating_sub(component_ids.len());
+        let capped_components = new_component_ids
+            .len()
+            .saturating_sub(remaining_component_capacity);
+        if new_component_ids.len() > remaining_component_capacity {
+            new_component_ids.truncate(remaining_component_capacity);
+        }
+        for id in &new_component_ids {
+            component_ids.insert(id.clone());
+        }
+        info!(
+            round,
+            new_components = new_component_ids.len(),
+            capped_components,
+            total_components = component_ids.len(),
+            "TychoTvlGraphExpansionNewComponentsSelected"
+        );
         if new_component_ids.is_empty() {
             break;
         }
@@ -417,13 +678,89 @@ async fn build_incremental_graph_scope(
         )
         .await
         .with_context(|| format!("failed to discover graph tokens in expansion round {round}"))?;
-        frontier = discovered_tokens
-            .into_iter()
-            .filter(|token| seen_tokens.insert(token.clone()))
-            .collect();
+        let frontier_selection = select_next_frontier(
+            discovered_tokens,
+            &mut seen_tokens,
+            seed_tokens,
+            max_intermediate_tokens,
+        );
+        frontier = frontier_selection.frontier;
+        info!(
+            round,
+            next_frontier_tokens = frontier.len(),
+            seen_tokens = seen_tokens.len(),
+            terminal_seed_tokens = frontier_selection.terminal_seed_tokens,
+            repeated_tokens = frontier_selection.repeated_tokens,
+            capped_frontier_tokens = frontier_selection.capped_frontier_tokens,
+            "TychoTvlGraphExpansionRoundComplete"
+        );
     }
 
+    info!(
+        components = component_ids.len(),
+        affected_components = affected_component_ids.len(),
+        graph_tokens = seen_tokens.len(),
+        "TychoTvlIncrementalGraphBuildComplete"
+    );
     Ok(ComponentGraphScope { component_ids, affected_component_ids, graph_tokens: seen_tokens })
+}
+
+#[derive(Debug, Default)]
+struct FrontierSelection {
+    frontier: HashSet<Bytes>,
+    terminal_seed_tokens: usize,
+    repeated_tokens: usize,
+    capped_frontier_tokens: usize,
+}
+
+fn select_next_frontier(
+    discovered_tokens: impl IntoIterator<Item = Bytes>,
+    seen_tokens: &mut HashSet<Bytes>,
+    seed_tokens: &HashSet<Bytes>,
+    max_frontier_tokens: usize,
+) -> FrontierSelection {
+    let mut selection = FrontierSelection::default();
+    let mut frontier = HashSet::new();
+
+    for token in discovered_tokens {
+        if !seen_tokens.insert(token.clone()) {
+            selection.repeated_tokens += 1;
+            continue;
+        }
+
+        // Existing DB prices and hard anchors are valid route endpoints. Expanding through them is
+        // dangerous for incremental runs because hub assets such as WETH or USDC connect to
+        // enormous portions of the graph. Keeping them out of the next frontier still lets their
+        // current prices drive simulations in the components already loaded, while preventing one
+        // recently changed component from becoming a near-full-chain scan.
+        if seed_tokens.contains(&token) {
+            selection.terminal_seed_tokens += 1;
+            continue;
+        }
+
+        frontier.insert(token);
+    }
+
+    let (frontier, capped_frontier_tokens) = limit_token_set(frontier, max_frontier_tokens);
+    selection.frontier = frontier;
+    selection.capped_frontier_tokens = capped_frontier_tokens;
+    selection
+}
+
+fn limit_token_set(tokens: HashSet<Bytes>, limit: usize) -> (HashSet<Bytes>, usize) {
+    if limit == 0 {
+        let capped = tokens.len();
+        return (HashSet::new(), capped);
+    }
+    if tokens.len() <= limit {
+        return (tokens, 0);
+    }
+
+    let original_len = tokens.len();
+    let mut tokens = tokens.into_iter().collect::<Vec<_>>();
+    tokens.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    tokens.truncate(limit);
+    (tokens.into_iter().collect(), original_len - limit)
 }
 
 async fn discover_component_tokens(
@@ -439,6 +776,11 @@ async fn discover_component_tokens(
     let mut tokens = HashSet::new();
     for protocol_system in protocol_systems {
         for id_batch in component_ids.chunks(batch_size.max(1)) {
+            debug!(
+                protocol_system = %protocol_system,
+                batch_components = id_batch.len(),
+                "TychoTvlDiscoveringComponentTokensBatch"
+            );
             let id_refs = id_batch
                 .iter()
                 .map(String::as_str)
@@ -459,12 +801,18 @@ async fn discover_component_tokens(
             }
         }
     }
+    info!(
+        components = component_ids.len(),
+        discovered_tokens = tokens.len(),
+        "TychoTvlComponentTokensDiscovered"
+    );
     Ok(tokens)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn price_components(
     storage: &DirectGateway,
+    tvl_db: &TvlDb,
     chain: Chain,
     latest_block: u64,
     protocol_systems: &[String],
@@ -478,11 +826,34 @@ async fn price_components(
     let mut candidates = Vec::new();
 
     for protocol_system in protocol_systems {
-        for id_batch in component_ids.chunks(snapshot_batch_size.max(1)) {
-            let id_refs = id_batch
+        for (batch_index, id_batch) in component_ids
+            .chunks(snapshot_batch_size.max(1))
+            .enumerate()
+        {
+            let load_ids = filter_component_ids_for_simulation(
+                tvl_db,
+                chain,
+                protocol_system,
+                id_batch,
+                batch_index,
+            )
+            .await?;
+            if load_ids.is_empty() {
+                continue;
+            }
+
+            let id_refs = load_ids
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
+
+            info!(
+                protocol_system = %protocol_system,
+                batch_index,
+                batch_components = id_batch.len(),
+                eligible_components = load_ids.len(),
+                "TychoTvlPricingBatchLoadingComponents"
+            );
             let components = ProtocolGateway::get_protocol_components(
                 storage,
                 &chain,
@@ -497,10 +868,23 @@ async fn price_components(
             .into_iter()
             .map(ResponseProtocolComponent::from)
             .collect::<Vec<_>>();
+            info!(
+                protocol_system = %protocol_system,
+                batch_index,
+                components = components.len(),
+                "TychoTvlPricingBatchComponentsLoaded"
+            );
             if components.is_empty() {
                 continue;
             }
 
+            info!(
+                protocol_system = %protocol_system,
+                batch_index,
+                components = components.len(),
+                latest_block,
+                "TychoTvlPricingBatchLoadingStates"
+            );
             let states = ProtocolGateway::get_protocol_states(
                 storage,
                 &chain,
@@ -516,12 +900,19 @@ async fn price_components(
             .into_iter()
             .map(|state| (state.component_id.clone(), ResponseProtocolState::from(state)))
             .collect::<HashMap<_, _>>();
+            info!(
+                protocol_system = %protocol_system,
+                batch_index,
+                states = states.len(),
+                "TychoTvlPricingBatchStatesLoaded"
+            );
 
             // Decode current pool state and emit every executable priced-input -> output-token
             // quote as a candidate. This function deliberately does not decide "the" price for a
             // token. A token may have many candidate prices from different pools and different
             // multi-hop routes; `pricing::select_round_updates` compares them globally for the
             // current pass and only applies improvements to the price book.
+            let components_len = components.len();
             let snapshots = components
                 .into_iter()
                 .filter_map(|component| {
@@ -536,7 +927,19 @@ async fn price_components(
                         })
                 })
                 .collect::<Vec<_>>();
+            info!(
+                protocol_system = %protocol_system,
+                batch_index,
+                snapshots = snapshots.len(),
+                missing_states = components_len.saturating_sub(snapshots.len()),
+                "TychoTvlPricingBatchSnapshotsBuilt"
+            );
 
+            let mut batch_candidates = 0usize;
+            let mut decoded_components = 0usize;
+            let mut skipped_components = 0usize;
+            let mut decode_skip_stats = DecodeSkipStats::default();
+            let rejected_before = stats.rejected_edges;
             for component_state in snapshots {
                 let sim = match decode_state(
                     protocol_system,
@@ -546,9 +949,19 @@ async fn price_components(
                 )
                 .await
                 {
-                    Ok(sim) => sim,
+                    Ok(sim) => {
+                        decoded_components += 1;
+                        sim
+                    }
                     Err(err) => {
-                        debug!(%protocol_system, error = %err, "StateDecodeSkipped");
+                        skipped_components += 1;
+                        decode_skip_stats.record(&err);
+                        trace!(
+                            %protocol_system,
+                            component_id = %component_state.component.id,
+                            error = %err,
+                            "StateDecodeSkipped"
+                        );
                         continue;
                     }
                 };
@@ -578,6 +991,7 @@ async fn price_components(
                             max_deviation_bps,
                         ) {
                             Some(candidate) => {
+                                batch_candidates += 1;
                                 candidates.push(PriceCandidate {
                                     token: token_out_addr.clone(),
                                     native_per_token: candidate.0,
@@ -593,10 +1007,61 @@ async fn price_components(
                     }
                 }
             }
+            info!(
+                protocol_system = %protocol_system,
+                batch_index,
+                decoded_components,
+                skipped_components,
+                candidates = batch_candidates,
+                rejected_edges = stats.rejected_edges.saturating_sub(rejected_before),
+                total_candidates = candidates.len(),
+                decode_skip_reasons = %decode_skip_stats.summary(),
+                "TychoTvlPricingBatchComplete"
+            );
         }
     }
 
     Ok(candidates)
+}
+
+async fn filter_component_ids_for_simulation(
+    tvl_db: &TvlDb,
+    chain: Chain,
+    protocol_system: &str,
+    component_ids: &[String],
+    batch_index: usize,
+) -> Result<Vec<String>> {
+    if protocol_system != "uniswap_v3" {
+        return Ok(component_ids.to_vec());
+    }
+
+    info!(
+        protocol_system,
+        batch_index,
+        batch_components = component_ids.len(),
+        "TychoTvlFilteringV3ComponentsWithTickState"
+    );
+    let filtered = tvl_db
+        .filter_components_with_state_requirements(
+            &chain,
+            component_ids,
+            &["liquidity", "sqrt_price_x96", "tick"],
+            &["ticks/"],
+        )
+        .await
+        .context("failed to filter uniswap_v3 components by required state attributes")?;
+    info!(
+        protocol_system,
+        batch_index,
+        batch_components = component_ids.len(),
+        eligible_components = filtered.len(),
+        skipped_components = component_ids
+            .len()
+            .saturating_sub(filtered.len()),
+        "TychoTvlV3ComponentsWithTickStateFiltered"
+    );
+
+    Ok(filtered)
 }
 
 async fn decode_state(
@@ -648,7 +1113,7 @@ fn price_edge(
         .get_limits(token_in.address.clone(), token_out.address.clone())
         .ok();
 
-    let mut quoted_prices = Vec::new();
+    let mut probe_quotes = Vec::new();
     for (probe_native, weight) in probes {
         let input_whole = probe_native / token_in_native_price;
         let Some(amount_in) = amount_to_raw(input_whole, token_in.decimals) else {
@@ -672,21 +1137,111 @@ fn price_edge(
         if output_whole <= 0.0 || !output_whole.is_finite() {
             continue;
         }
-        quoted_prices.push((probe_native / output_whole, weight));
+        probe_quotes.push(ProbeQuote {
+            output_raw: quote.amount,
+            output_whole,
+            native_per_token: probe_native / output_whole,
+            weight,
+        });
     }
 
+    let quoted_prices = probe_quotes
+        .iter()
+        .map(|quote| (quote.native_per_token, quote.weight))
+        .collect::<Vec<_>>();
+    let selected = select_edge_price_from_probes(&quoted_prices, max_deviation_bps)?;
+    let adjusted_price = sell_side_adjusted_price(
+        sim,
+        token_in,
+        token_out,
+        token_in_native_price,
+        &probe_quotes,
+        selected.0,
+        max_deviation_bps,
+    )
+    .unwrap_or(selected.0);
+
+    Some((adjusted_price, selected.1))
+}
+
+fn sell_side_adjusted_price(
+    sim: &dyn ProtocolSim,
+    token_in: &Token,
+    token_out: &Token,
+    token_in_native_price: f64,
+    probe_quotes: &[ProbeQuote],
+    selected_native_per_token: f64,
+    max_deviation_bps: f64,
+) -> Option<f64> {
+    let mut reverse_prices = Vec::new();
+    for quote in probe_quotes {
+        let forward_dev_bps = ((quote.native_per_token - selected_native_per_token).abs()
+            / selected_native_per_token)
+            * 10_000.0;
+        if forward_dev_bps > max_deviation_bps {
+            continue;
+        }
+
+        let Ok(reverse_quote) = sim.get_amount_out(quote.output_raw.clone(), token_out, token_in)
+        else {
+            continue;
+        };
+        let Some(recovered_input_whole) = raw_to_amount(&reverse_quote.amount, token_in.decimals)
+        else {
+            continue;
+        };
+        if recovered_input_whole <= 0.0 || !recovered_input_whole.is_finite() {
+            continue;
+        }
+
+        let recovered_native = recovered_input_whole * token_in_native_price;
+        let reverse_native_per_token = recovered_native / quote.output_whole;
+        if reverse_native_per_token.is_finite() && reverse_native_per_token > 0.0 {
+            reverse_prices.push((reverse_native_per_token, quote.weight));
+        }
+    }
+
+    let (sell_side_native_per_token, _) =
+        select_edge_price_from_probes(&reverse_prices, max_deviation_bps)?;
+    Some(sell_side_native_per_token.min(selected_native_per_token))
+}
+
+fn select_edge_price_from_probes(
+    quoted_prices: &[(f64, f64)],
+    max_deviation_bps: f64,
+) -> Option<(f64, f64)> {
     if quoted_prices.len() < 2 {
         return None;
     }
 
-    let median = weighted_median(&quoted_prices)?;
-    let max_dev_bps = quoted_prices
+    let median = weighted_median(quoted_prices)?;
+    let mut inliers = quoted_prices
+        .iter()
+        .copied()
+        .filter(|(price, _)| ((*price - median).abs() / median) * 10_000.0 <= max_deviation_bps)
+        .collect::<Vec<_>>();
+    let inlier_weight = inliers
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<f64>();
+    if inliers.len() < 2 || inlier_weight + f64::EPSILON < MIN_EDGE_INLIER_WEIGHT {
+        return None;
+    }
+
+    let median = weighted_median(&inliers)?;
+    inliers.retain(|(price, _)| ((*price - median).abs() / median) * 10_000.0 <= max_deviation_bps);
+    let inlier_weight = inliers
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<f64>();
+    if inliers.len() < 2 || inlier_weight + f64::EPSILON < MIN_EDGE_INLIER_WEIGHT {
+        return None;
+    }
+
+    let max_dev_bps = inliers
         .iter()
         .map(|(price, _)| ((price - median).abs() / median) * 10_000.0)
         .fold(0.0, f64::max);
-    if max_dev_bps > max_deviation_bps {
-        return None;
-    }
 
     Some((median, max_dev_bps))
 }
@@ -793,5 +1348,66 @@ mod tests {
     fn weighted_median_ignores_invalid_values() {
         let values = [(0.0, 0.25), (42.0, 0.60), (50.0, 0.15)];
         assert_eq!(weighted_median(&values), Some(42.0));
+    }
+
+    #[test]
+    fn edge_price_accepts_large_probe_slippage_outlier() {
+        let values = [(1.10, 0.25), (1.0, 0.60), (1.0, 0.15)];
+        assert_eq!(select_edge_price_from_probes(&values, 300.0), Some((1.0, 0.0)));
+    }
+
+    #[test]
+    fn edge_price_rejects_when_middle_probe_is_outlier() {
+        let values = [(1.0, 0.25), (1.10, 0.60), (1.0, 0.15)];
+        assert_eq!(select_edge_price_from_probes(&values, 300.0), None);
+    }
+
+    #[test]
+    fn edge_price_accepts_tiny_probe_outlier() {
+        let values = [(1.0, 0.25), (1.0, 0.60), (1.10, 0.15)];
+        assert_eq!(select_edge_price_from_probes(&values, 300.0), Some((1.0, 0.0)));
+    }
+
+    #[test]
+    fn incremental_frontier_does_not_expand_through_seed_tokens() {
+        let seen = Bytes::from(vec![1; 20]);
+        let seed = Bytes::from(vec![2; 20]);
+        let new = Bytes::from(vec![3; 20]);
+        let mut seen_tokens = HashSet::from([seen.clone()]);
+        let seed_tokens = HashSet::from([seed.clone()]);
+
+        let selection = select_next_frontier(
+            vec![seen.clone(), seed.clone(), new.clone()],
+            &mut seen_tokens,
+            &seed_tokens,
+            10,
+        );
+
+        assert_eq!(selection.frontier, HashSet::from([new]));
+        assert_eq!(selection.terminal_seed_tokens, 1);
+        assert_eq!(selection.repeated_tokens, 1);
+        assert!(seen_tokens.contains(&seen));
+        assert!(seen_tokens.contains(&seed));
+    }
+
+    #[test]
+    fn incremental_frontier_is_capped() {
+        let mut seen_tokens = HashSet::new();
+        let seed_tokens = HashSet::new();
+        let selection = select_next_frontier(
+            vec![Bytes::from(vec![3; 20]), Bytes::from(vec![1; 20]), Bytes::from(vec![2; 20])],
+            &mut seen_tokens,
+            &seed_tokens,
+            2,
+        );
+
+        assert_eq!(selection.frontier.len(), 2);
+        assert_eq!(selection.capped_frontier_tokens, 1);
+        assert!(selection
+            .frontier
+            .contains(&Bytes::from(vec![1; 20])));
+        assert!(selection
+            .frontier
+            .contains(&Bytes::from(vec![2; 20])));
     }
 }
