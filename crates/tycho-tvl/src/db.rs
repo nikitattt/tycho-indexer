@@ -11,6 +11,7 @@ use diesel_async::{
     pooled_connection::{deadpool::Pool, AsyncDieselConnectionManager},
     AsyncPgConnection, RunQueryDsl,
 };
+use tracing::info;
 use tycho_common::{models::Chain, Bytes};
 
 #[derive(Clone)]
@@ -470,6 +471,118 @@ SELECT COUNT(*)::bigint AS updated_count FROM upserted
                     .with_context(|| format!("failed to refresh component TVL for {chain}"))?
             };
             affected += row.updated_count as usize;
+        }
+
+        Ok(affected)
+    }
+
+    pub async fn count_inactive_nonzero_component_tvl(
+        &self,
+        chain: &Chain,
+        protocol_systems: &[String],
+        active_since: NaiveDateTime,
+    ) -> Result<usize> {
+        if protocol_systems.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.connection().await?;
+        let row = sql_query(
+            r#"
+SELECT COUNT(*)::bigint AS updated_count
+FROM component_tvl ct
+JOIN protocol_component pc ON pc.id = ct.protocol_component_id
+JOIN chain c ON c.id = pc.chain_id
+JOIN protocol_system ps ON ps.id = pc.protocol_system_id
+WHERE c.name = $1
+  AND ps.name = ANY($2)
+  AND pc.deleted_at IS NULL
+  AND ct.tvl <> 0.0
+  AND NOT EXISTS (
+      SELECT 1
+      FROM component_balance_default cb
+      WHERE cb.protocol_component_id = pc.id
+        AND cb.valid_from >= $3
+  )
+"#,
+        )
+        .bind::<Text, _>(chain.to_string())
+        .bind::<Array<Text>, _>(protocol_systems.to_vec())
+        .bind::<Timestamp, _>(active_since)
+        .get_result::<TvlRefreshCount>(&mut conn)
+        .await
+        .with_context(|| format!("failed to count inactive component TVL rows for {chain}"))?;
+
+        Ok(row.updated_count as usize)
+    }
+
+    pub async fn zero_inactive_component_tvl(
+        &self,
+        chain: &Chain,
+        protocol_systems: &[String],
+        active_since: NaiveDateTime,
+        batch_size: usize,
+    ) -> Result<usize> {
+        if protocol_systems.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.connection().await?;
+        let mut affected = 0usize;
+        let mut batch_index = 0usize;
+        loop {
+            let row = sql_query(
+                r#"
+WITH target_component AS (
+    SELECT pc.id
+    FROM component_tvl ct
+    JOIN protocol_component pc ON pc.id = ct.protocol_component_id
+    JOIN chain c ON c.id = pc.chain_id
+    JOIN protocol_system ps ON ps.id = pc.protocol_system_id
+    WHERE c.name = $1
+      AND ps.name = ANY($2)
+      AND pc.deleted_at IS NULL
+      AND ct.tvl <> 0.0
+      AND NOT EXISTS (
+          SELECT 1
+          FROM component_balance_default cb
+          WHERE cb.protocol_component_id = pc.id
+            AND cb.valid_from >= $3
+      )
+    ORDER BY pc.id
+    LIMIT $4
+),
+updated AS (
+    UPDATE component_tvl ct
+    SET tvl = 0.0
+    FROM target_component target
+    WHERE ct.protocol_component_id = target.id
+    RETURNING ct.protocol_component_id
+)
+SELECT COUNT(*)::bigint AS updated_count
+FROM updated
+"#,
+            )
+            .bind::<Text, _>(chain.to_string())
+            .bind::<Array<Text>, _>(protocol_systems.to_vec())
+            .bind::<Timestamp, _>(active_since)
+            .bind::<BigInt, _>(batch_size.max(1) as i64)
+            .get_result::<TvlRefreshCount>(&mut conn)
+            .await
+            .with_context(|| format!("failed to zero inactive component TVL rows for {chain}"))?;
+
+            let updated = row.updated_count as usize;
+            if updated == 0 {
+                break;
+            }
+            affected += updated;
+            info!(
+                batch_index,
+                batch_updated = updated,
+                total_updated = affected,
+                "TychoTvlPruneStaleComponentsBatchUpdated"
+            );
+            batch_index += 1;
         }
 
         Ok(affected)

@@ -53,12 +53,13 @@ All CLI flags:
 
 | Flag | Env | Default | Description |
 | --- | --- | --- | --- |
-| `--run-mode initial\|incremental` | | `incremental` | Selects broad discovery or cron-friendly update mode. |
+| `--run-mode initial\|incremental\|prune-stale-components` | | `incremental` | Selects broad discovery, cron-friendly update, or stale TVL pruning mode. |
 | `--chain <chain>` | | `base` | Chain to process. Must match Tycho's `Chain` enum names. |
 | `--database-url <url>` | `DATABASE_URL` | required | Postgres database used by the indexer. |
 | `--protocol-systems <csv>` | | `uniswap_v2,uniswap_v3` | Comma-separated protocol systems to price and refresh TVL for. |
 | `--cron-period-secs <secs>` | | `300` | Expected timer period for incremental mode. |
 | `--recent-window-multiplier <n>` | | `2` | Incremental changed-component window is `cron_period_secs * recent_window_multiplier`. |
+| `--active-window-days <days>` | | `42` | Prune mode treats components as active when any balance changed in this window. |
 | `--max-rounds-initial <n>` | | `6` | Maximum solver relaxation rounds in initial mode. |
 | `--max-rounds-incremental <n>` | | `4` | Maximum graph expansion and solver rounds in incremental mode. |
 | `--min-initial-update-bps <bps>` | | `10` | Stops initial mode after applying a round when `updates / known_prices` at round start is below this value. Use `0` to disable this early stop. |
@@ -181,6 +182,45 @@ last ten minutes of balance changes:
 
 ```text
 300 seconds * 2 = 600 seconds
+```
+
+### Prune Stale Components
+
+Prune mode is the daily cleanup job for keeping `tvl_gt` queries focused on
+recently active pools:
+
+```bash
+DATABASE_URL=postgresql://postgres:mypassword@localhost:5431/tycho_indexer_0 \
+RUST_LOG=info \
+target/release/tycho-tvl \
+  --run-mode prune-stale-components \
+  --chain base \
+  --active-window-days 42
+```
+
+It does not change `token_price`. It only sets `component_tvl.tvl = 0.0` for
+scoped components whose existing TVL is nonzero and whose balances have not
+changed recently:
+
+```sql
+NOT EXISTS (
+  SELECT 1
+  FROM component_balance_default cb
+  WHERE cb.protocol_component_id = protocol_component.id
+    AND cb.valid_from >= now() - interval '42 days'
+)
+```
+
+This keeps old prices available as graph seeds/debug context while removing
+dead pools from `/v1/protocol_components` queries that use `tvl_gt`.
+
+Use `--dry-run` to count rows that would be zeroed:
+
+```bash
+target/release/tycho-tvl \
+  --run-mode prune-stale-components \
+  --chain base \
+  --dry-run
 ```
 
 ## Pricing Behavior
@@ -355,6 +395,8 @@ Install service and timer:
 ```bash
 sudo cp crates/tycho-tvl/systemd/tycho-tvl.service /etc/systemd/system/
 sudo cp crates/tycho-tvl/systemd/tycho-tvl.timer /etc/systemd/system/
+sudo cp crates/tycho-tvl/systemd/tycho-tvl-prune.service /etc/systemd/system/
+sudo cp crates/tycho-tvl/systemd/tycho-tvl-prune.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
@@ -373,6 +415,14 @@ systemctl list-timers tycho-tvl.timer
 journalctl -u tycho-tvl.service -f
 ```
 
+Enable the daily stale-component prune timer:
+
+```bash
+sudo systemctl enable --now tycho-tvl-prune.timer
+systemctl list-timers tycho-tvl-prune.timer
+journalctl -u tycho-tvl-prune.service -f
+```
+
 Initial mode is manual and intentionally not part of the timer:
 
 ```bash
@@ -385,6 +435,8 @@ sudo -u tycho \
 
 - Run `initial` before relying on `tvl_gt` filters on a fresh database.
 - Run `incremental` every five minutes after the initial bootstrap.
+- Run `prune-stale-components` daily so pools without recent balance changes do
+  not keep polluting `tvl_gt` query results.
 - Run database migrations with the normal indexer deployment path before starting
   `tycho-tvl`; the sidecar intentionally skips migrations on startup.
 - If `--dry-run` reports zero prices, verify that the selected chain has WETH

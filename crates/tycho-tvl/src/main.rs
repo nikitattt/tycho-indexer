@@ -46,6 +46,7 @@ const MIN_EDGE_INLIER_WEIGHT: f64 = 0.60;
 enum RunMode {
     Initial,
     Incremental,
+    PruneStaleComponents,
 }
 
 #[derive(Debug, Parser)]
@@ -63,6 +64,8 @@ struct Cli {
     cron_period_secs: i64,
     #[arg(long, default_value_t = 2)]
     recent_window_multiplier: i64,
+    #[arg(long, default_value_t = 42)]
+    active_window_days: i64,
     #[arg(long, default_value_t = 6)]
     max_rounds_initial: usize,
     #[arg(long, default_value_t = 4)]
@@ -197,6 +200,7 @@ async fn run(cli: Cli) -> Result<()> {
         protocol_systems = ?cli.protocol_systems,
         cron_period_secs = cli.cron_period_secs,
         recent_window_multiplier = cli.recent_window_multiplier,
+        active_window_days = cli.active_window_days,
         max_rounds_initial = cli.max_rounds_initial,
         max_rounds_incremental = cli.max_rounds_incremental,
         min_initial_update_bps = cli.min_initial_update_bps,
@@ -211,13 +215,20 @@ async fn run(cli: Cli) -> Result<()> {
         "TychoTvlRunStarting"
     );
 
+    info!("TychoTvlOpeningSidecarDb");
+    let tvl_db = TvlDb::connect(&cli.database_url)?;
+    info!("TychoTvlSidecarDbReady");
+
+    if matches!(cli.run_mode, RunMode::PruneStaleComponents) {
+        return run_prune_stale_components(&cli, &chain, &tvl_db).await;
+    }
+
     info!("TychoTvlOpeningDatabaseGateway");
     let storage = GatewayBuilder::new(&cli.database_url)
         .set_chains(&[chain])
         .build_direct_gw()
         .await
         .context("failed to build direct storage gateway")?;
-    let tvl_db = TvlDb::connect(&cli.database_url)?;
     info!("TychoTvlDatabaseGatewayReady");
 
     info!("TychoTvlLoadingLatestBlock");
@@ -298,6 +309,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .collect();
             changed_tokens
         }
+        RunMode::PruneStaleComponents => unreachable!("prune mode exits before pricing"),
     };
     stats.target_tokens = target_tokens.len();
     info!(target_tokens = target_tokens.len(), "TychoTvlTargetTokensSelected");
@@ -330,6 +342,7 @@ async fn run(cli: Cli) -> Result<()> {
     let max_rounds = match cli.run_mode {
         RunMode::Initial => cli.max_rounds_initial,
         RunMode::Incremental => cli.max_rounds_incremental,
+        RunMode::PruneStaleComponents => unreachable!("prune mode exits before pricing"),
     };
 
     // Build the pool graph that the pricing solver will repeatedly relax.
@@ -383,6 +396,7 @@ async fn run(cli: Cli) -> Result<()> {
         )
         .await
         .context("failed to build incremental component graph")?,
+        RunMode::PruneStaleComponents => unreachable!("prune mode exits before pricing"),
     };
     stats.graph_tokens = graph_scope.graph_tokens.len();
     stats.components_scanned = graph_scope.component_ids.len();
@@ -518,6 +532,7 @@ async fn run(cli: Cli) -> Result<()> {
             let write_mode = match cli.run_mode {
                 RunMode::Initial => PriceWriteMode::Initial,
                 RunMode::Incremental => PriceWriteMode::Incremental,
+                RunMode::PruneStaleComponents => unreachable!("prune mode exits before pricing"),
             };
             should_write_price(
                 write_mode,
@@ -576,6 +591,49 @@ async fn run(cli: Cli) -> Result<()> {
     info!(components_updated = stats.tvl_updated, "TychoTvlComponentTvlRefreshed");
 
     info!(?stats, "TychoTvlRunComplete");
+    Ok(())
+}
+
+async fn run_prune_stale_components(cli: &Cli, chain: &Chain, tvl_db: &TvlDb) -> Result<()> {
+    if cli.active_window_days <= 0 {
+        bail!("--active-window-days must be greater than 0");
+    }
+
+    info!("TychoTvlLoadingDbTimestamp");
+    let now = tvl_db
+        .get_current_db_timestamp()
+        .await
+        .context("failed to get DB timestamp")?;
+    let active_since = now - ChronoDuration::days(cli.active_window_days);
+    info!(
+        now = %now,
+        active_since = %active_since,
+        active_window_days = cli.active_window_days,
+        protocol_systems = ?cli.protocol_systems,
+        "TychoTvlPruneStaleComponentsStarting"
+    );
+
+    let stale_components = tvl_db
+        .count_inactive_nonzero_component_tvl(chain, &cli.protocol_systems, active_since)
+        .await
+        .context("failed to count inactive component TVL rows")?;
+    info!(components = stale_components, "TychoTvlPruneStaleComponentsCounted");
+
+    if cli.dry_run {
+        info!(components = stale_components, "TychoTvlPruneStaleComponentsDryRunComplete");
+        return Ok(());
+    }
+
+    let updated = tvl_db
+        .zero_inactive_component_tvl(
+            chain,
+            &cli.protocol_systems,
+            active_since,
+            cli.write_batch_size,
+        )
+        .await
+        .context("failed to zero inactive component TVL rows")?;
+    info!(components_updated = updated, "TychoTvlPruneStaleComponentsComplete");
     Ok(())
 }
 
