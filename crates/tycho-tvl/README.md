@@ -60,6 +60,7 @@ All CLI flags:
 | `--cron-period-secs <secs>` | | `300` | Expected timer period for incremental mode. |
 | `--recent-window-multiplier <n>` | | `2` | Incremental changed-component window is `cron_period_secs * recent_window_multiplier`. |
 | `--active-window-days <days>` | | `42` | Prune mode treats components as active when any balance changed in this window. |
+| `--prune-min-tvl <native>` | | `0.1` | Prune mode only zeroes inactive components whose current TVL is greater than this value. |
 | `--max-rounds-initial <n>` | | `6` | Maximum solver relaxation rounds in initial mode. |
 | `--max-rounds-incremental <n>` | | `4` | Maximum graph expansion and solver rounds in incremental mode. |
 | `--min-initial-update-bps <bps>` | | `10` | Stops initial mode after applying a round when `updates / known_prices` at round start is below this value. Use `0` to disable this early stop. |
@@ -195,14 +196,17 @@ RUST_LOG=info \
 target/release/tycho-tvl \
   --run-mode prune-stale-components \
   --chain base \
-  --active-window-days 42
+  --active-window-days 42 \
+  --prune-min-tvl 0.1
 ```
 
 It does not change `token_price`. It only sets `component_tvl.tvl = 0.0` for
-scoped components whose existing TVL is nonzero and whose balances have not
-changed recently:
+scoped components whose existing TVL is greater than `--prune-min-tvl` and
+whose balances have not changed recently:
 
 ```sql
+component_tvl.tvl > 0.1
+AND
 NOT EXISTS (
   SELECT 1
   FROM component_balance_default cb
@@ -213,6 +217,8 @@ NOT EXISTS (
 
 This keeps old prices available as graph seeds/debug context while removing
 dead pools from `/v1/protocol_components` queries that use `tvl_gt`.
+Rows with `component_tvl.tvl <= 0.1` are skipped by default to avoid spending
+large daily prune time on tiny pools.
 
 Use `--dry-run` to count rows that would be zeroed:
 

@@ -481,6 +481,7 @@ SELECT COUNT(*)::bigint AS updated_count FROM upserted
         chain: &Chain,
         protocol_systems: &[String],
         active_since: NaiveDateTime,
+        min_tvl: f64,
     ) -> Result<usize> {
         if protocol_systems.is_empty() {
             return Ok(0);
@@ -497,7 +498,7 @@ JOIN protocol_system ps ON ps.id = pc.protocol_system_id
 WHERE c.name = $1
   AND ps.name = ANY($2)
   AND pc.deleted_at IS NULL
-  AND ct.tvl <> 0.0
+  AND ct.tvl > $4
   AND NOT EXISTS (
       SELECT 1
       FROM component_balance_default cb
@@ -509,6 +510,7 @@ WHERE c.name = $1
         .bind::<Text, _>(chain.to_string())
         .bind::<Array<Text>, _>(protocol_systems.to_vec())
         .bind::<Timestamp, _>(active_since)
+        .bind::<Double, _>(min_tvl)
         .get_result::<TvlRefreshCount>(&mut conn)
         .await
         .with_context(|| format!("failed to count inactive component TVL rows for {chain}"))?;
@@ -521,6 +523,7 @@ WHERE c.name = $1
         chain: &Chain,
         protocol_systems: &[String],
         active_since: NaiveDateTime,
+        min_tvl: f64,
         batch_size: usize,
     ) -> Result<usize> {
         if protocol_systems.is_empty() {
@@ -542,7 +545,7 @@ WITH target_component AS (
     WHERE c.name = $1
       AND ps.name = ANY($2)
       AND pc.deleted_at IS NULL
-      AND ct.tvl <> 0.0
+      AND ct.tvl > $4
       AND NOT EXISTS (
           SELECT 1
           FROM component_balance_default cb
@@ -550,7 +553,7 @@ WITH target_component AS (
             AND cb.valid_from >= $3
       )
     ORDER BY pc.id
-    LIMIT $4
+    LIMIT $5
 ),
 updated AS (
     UPDATE component_tvl ct
@@ -566,6 +569,7 @@ FROM updated
             .bind::<Text, _>(chain.to_string())
             .bind::<Array<Text>, _>(protocol_systems.to_vec())
             .bind::<Timestamp, _>(active_since)
+            .bind::<Double, _>(min_tvl)
             .bind::<BigInt, _>(batch_size.max(1) as i64)
             .get_result::<TvlRefreshCount>(&mut conn)
             .await

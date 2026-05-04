@@ -66,6 +66,8 @@ struct Cli {
     recent_window_multiplier: i64,
     #[arg(long, default_value_t = 42)]
     active_window_days: i64,
+    #[arg(long, default_value_t = 0.1)]
+    prune_min_tvl: f64,
     #[arg(long, default_value_t = 6)]
     max_rounds_initial: usize,
     #[arg(long, default_value_t = 4)]
@@ -201,6 +203,7 @@ async fn run(cli: Cli) -> Result<()> {
         cron_period_secs = cli.cron_period_secs,
         recent_window_multiplier = cli.recent_window_multiplier,
         active_window_days = cli.active_window_days,
+        prune_min_tvl = cli.prune_min_tvl,
         max_rounds_initial = cli.max_rounds_initial,
         max_rounds_incremental = cli.max_rounds_incremental,
         min_initial_update_bps = cli.min_initial_update_bps,
@@ -598,6 +601,9 @@ async fn run_prune_stale_components(cli: &Cli, chain: &Chain, tvl_db: &TvlDb) ->
     if cli.active_window_days <= 0 {
         bail!("--active-window-days must be greater than 0");
     }
+    if !cli.prune_min_tvl.is_finite() || cli.prune_min_tvl < 0.0 {
+        bail!("--prune-min-tvl must be a finite number greater than or equal to 0");
+    }
 
     info!("TychoTvlLoadingDbTimestamp");
     let now = tvl_db
@@ -609,12 +615,18 @@ async fn run_prune_stale_components(cli: &Cli, chain: &Chain, tvl_db: &TvlDb) ->
         now = %now,
         active_since = %active_since,
         active_window_days = cli.active_window_days,
+        prune_min_tvl = cli.prune_min_tvl,
         protocol_systems = ?cli.protocol_systems,
         "TychoTvlPruneStaleComponentsStarting"
     );
 
     let stale_components = tvl_db
-        .count_inactive_nonzero_component_tvl(chain, &cli.protocol_systems, active_since)
+        .count_inactive_nonzero_component_tvl(
+            chain,
+            &cli.protocol_systems,
+            active_since,
+            cli.prune_min_tvl,
+        )
         .await
         .context("failed to count inactive component TVL rows")?;
     info!(components = stale_components, "TychoTvlPruneStaleComponentsCounted");
@@ -629,6 +641,7 @@ async fn run_prune_stale_components(cli: &Cli, chain: &Chain, tvl_db: &TvlDb) ->
             chain,
             &cli.protocol_systems,
             active_since,
+            cli.prune_min_tvl,
             cli.write_batch_size,
         )
         .await
