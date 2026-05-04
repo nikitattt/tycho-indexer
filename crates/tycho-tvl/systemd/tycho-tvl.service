@@ -1,5 +1,5 @@
 [Unit]
-Description=Tycho TVL updater
+Description=Tycho Indexer TVL updater
 After=network-online.target postgresql.service tycho-indexer.service
 Wants=network-online.target
 

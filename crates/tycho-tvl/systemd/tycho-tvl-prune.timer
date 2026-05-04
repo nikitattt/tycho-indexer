@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Tycho TVL stale component pruner daily
+Description=Run Tycho Indexer TVL stale component pruner daily
 
 [Timer]
 OnBootSec=10min

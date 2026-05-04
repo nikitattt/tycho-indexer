@@ -49,7 +49,9 @@ DATABASE_URL=postgresql://postgres:mypassword@localhost:5431/tycho_indexer_0
 RUST_LOG=info
 ```
 
-All CLI flags:
+CLI flags are grouped by where they matter.
+
+Common flags:
 
 | Flag | Env | Default | Description |
 | --- | --- | --- | --- |
@@ -57,21 +59,41 @@ All CLI flags:
 | `--chain <chain>` | | `base` | Chain to process. Must match Tycho's `Chain` enum names. |
 | `--database-url <url>` | `DATABASE_URL` | required | Postgres database used by the indexer. |
 | `--protocol-systems <csv>` | | `uniswap_v2,uniswap_v3` | Comma-separated protocol systems to price and refresh TVL for. |
-| `--cron-period-secs <secs>` | | `300` | Expected timer period for incremental mode. |
-| `--recent-window-multiplier <n>` | | `2` | Incremental changed-component window is `cron_period_secs * recent_window_multiplier`. |
-| `--active-window-days <days>` | | `42` | Prune mode treats components as active when any balance changed in this window. |
-| `--prune-min-tvl <native>` | | `0.1` | Prune mode only zeroes inactive components whose current TVL is greater than this value. |
-| `--max-rounds-initial <n>` | | `6` | Maximum solver relaxation rounds in initial mode. |
-| `--max-rounds-incremental <n>` | | `4` | Maximum graph expansion and solver rounds in incremental mode. |
-| `--min-initial-update-bps <bps>` | | `10` | Stops initial mode after applying a round when `updates / known_prices` at round start is below this value. Use `0` to disable this early stop. |
-| `--min-price-improvement-bps <bps>` | | `10` | Existing token prices are replaced only when the native price changes by at least this amount. First-time prices are always accepted. Use `0` to disable this filter. |
-| `--write-batch-size <n>` | | `5000` | Batch size for token price writes and component TVL refreshes. |
-| `--snapshot-batch-size <n>` | | `500` | Batch size for DB component/state loading and simulation batches. |
-| `--max-deviation-bps <bps>` | | `300` | Rejects a pool edge when probe prices deviate too much. |
-| `--max-incremental-intermediate-tokens <n>` | | `60` | Maximum unpriced frontier tokens expanded per incremental graph round. |
-| `--max-incremental-components-per-token <n>` | | `25` | Maximum candidate pools loaded for each frontier token during incremental graph expansion. |
-| `--max-incremental-graph-components <n>` | | `25000` | Maximum total component count used for incremental route-expansion context. Recently changed components are always included. |
-| `--dry-run` | | `false` | Computes prices and TVL scope, logs stats, and writes nothing. |
+| `--write-batch-size <n>` | | `5000` | Batch size for token price writes and component TVL/prune updates. |
+| `--dry-run` | | `false` | Computes scope/counts and writes nothing. |
+
+Pricing flags used by `initial` and `incremental`:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--snapshot-batch-size <n>` | `500` | Batch size for DB component/state loading and simulation batches. |
+| `--max-deviation-bps <bps>` | `300` | Rejects a pool edge when probe prices deviate too much. |
+| `--min-price-improvement-bps <bps>` | `10` | Existing token prices are replaced only when the native price changes by at least this amount. First-time prices are always accepted. Use `0` to disable this filter. |
+
+Initial-only flags:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--max-rounds-initial <n>` | `6` | Maximum solver relaxation rounds in initial mode. |
+| `--min-initial-update-bps <bps>` | `10` | Stops initial mode after applying a round when `updates / known_prices` at round start is below this value. Use `0` to disable this early stop. |
+
+Incremental-only flags:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--cron-period-secs <secs>` | `300` | Expected timer period for incremental mode. |
+| `--recent-window-multiplier <n>` | `2` | Incremental changed-component window is `cron_period_secs * recent_window_multiplier`. |
+| `--max-rounds-incremental <n>` | `4` | Maximum graph expansion and solver rounds in incremental mode. |
+| `--max-incremental-intermediate-tokens <n>` | `60` | Maximum unpriced frontier tokens expanded per incremental graph round. |
+| `--max-incremental-components-per-token <n>` | `25` | Maximum candidate pools loaded for each frontier token during incremental graph expansion. |
+| `--max-incremental-graph-components <n>` | `25000` | Maximum total component count used for incremental route-expansion context. Recently changed components are always included. |
+
+Prune-only flags:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--active-window-days <days>` | `42` | Treats components as active when any balance changed in this window. |
+| `--prune-min-tvl <native>` | `0.0` | Only zero inactive components whose current TVL is greater than this value. Use `0.1` temporarily if pruning tiny pools is too slow. |
 
 ## Run Modes
 
@@ -196,8 +218,7 @@ RUST_LOG=info \
 target/release/tycho-tvl \
   --run-mode prune-stale-components \
   --chain base \
-  --active-window-days 42 \
-  --prune-min-tvl 0.1
+  --active-window-days 42
 ```
 
 It does not change `token_price`. It only sets `component_tvl.tvl = 0.0` for
@@ -205,7 +226,7 @@ scoped components whose existing TVL is greater than `--prune-min-tvl` and
 whose balances have not changed recently:
 
 ```sql
-component_tvl.tvl > 0.1
+component_tvl.tvl > 0.0
 AND
 NOT EXISTS (
   SELECT 1
@@ -217,8 +238,17 @@ NOT EXISTS (
 
 This keeps old prices available as graph seeds/debug context while removing
 dead pools from `/v1/protocol_components` queries that use `tvl_gt`.
-Rows with `component_tvl.tvl <= 0.1` are skipped by default to avoid spending
-large daily prune time on tiny pools.
+If pruning tiny pools is too slow, temporarily raise the TVL floor:
+
+```bash
+target/release/tycho-tvl \
+  --run-mode prune-stale-components \
+  --chain base \
+  --active-window-days 42 \
+  --prune-min-tvl 0.1
+```
+
+That skips rows with `component_tvl.tvl <= 0.1`.
 
 Use `--dry-run` to count rows that would be zeroed:
 

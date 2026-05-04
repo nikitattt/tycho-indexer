@@ -66,7 +66,7 @@ struct Cli {
     recent_window_multiplier: i64,
     #[arg(long, default_value_t = 42)]
     active_window_days: i64,
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(long, default_value_t = 0.0)]
     prune_min_tvl: f64,
     #[arg(long, default_value_t = 6)]
     max_rounds_initial: usize,

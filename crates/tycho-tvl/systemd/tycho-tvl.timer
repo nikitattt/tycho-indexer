@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Tycho TVL updater every 5 minutes
+Description=Run Tycho Indexer TVL updater every 5 minutes
 
 [Timer]
 OnBootSec=2min
