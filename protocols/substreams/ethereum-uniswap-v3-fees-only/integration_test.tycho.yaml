@@ -1,0 +1,20 @@
+substreams_yaml_path: ./base-uniswap-v3.yaml
+protocol_system: "base_uniswap_v3_fees_only"
+protocol_type_names:
+    - "uniswap_v3_fees"
+module_name: "map_protocol_fee_changes"
+skip_balance_check: true
+initialized_accounts:
+tests:
+    - name: test_first_base_protocol_fee_pool_candidate
+      start_block: 43186962
+      stop_block: 43189231
+      expected_components:
+          - id: "v3-fees:0x3e3590ff5088da112841e7a21fd286869148eaeb"
+            tokens: []
+            static_attributes:
+                pool_address: "0x3e3590ff5088da112841e7a21fd286869148eaeb"
+                source_component_id: "0x3e3590ff5088da112841e7a21fd286869148eaeb"
+            creation_tx: "0xea4951c66bb5e340ea50094905f283d74c34bb2d6a06f0627aaa20d50381f9c3"
+            skip_simulation: true
+            skip_execution: true
