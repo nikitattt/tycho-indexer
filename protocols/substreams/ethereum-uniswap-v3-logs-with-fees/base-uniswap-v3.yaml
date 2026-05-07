@@ -5,8 +5,7 @@ package:
     url: "https://github.com/propeller-heads/tycho-indexer/tree/main/protocols/substreams/ethereum-uniswap-v3-logs-with-fees"
 
 imports:
-    v3_logs: ../ethereum-uniswap-v3-logs-only/base-uniswap-v3-logs-only-v0.1.2.spkg
-    # v3_logs: ../ethereum-uniswap-v3-logs-only/base-uniswap-v3.yaml
+    v3_logs: ./spkg/base-uniswap-v3-logs-only-v0.1.2.spkg
 
 binaries:
     default:
