@@ -2,7 +2,6 @@ specVersion: v0.1.0
 package:
     name: "base_uniswap_v2_with_extra"
     version: v0.1.0
-    url: "https://github.com/propeller-heads/tycho-indexer/tree/main/protocols/substreams/ethereum-uniswap-v2-with-extra"
 
 imports:
     v2: ./spkg/base-uniswap-v2-v0.3.2.spkg
