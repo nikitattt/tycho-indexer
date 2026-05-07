@@ -20,14 +20,14 @@ pub fn protocol_fee_attributes(storage_changes: &[StorageChange], pool: &[u8]) -
 
         push_protocol_fee_attribute(
             &mut attributes,
-            "protocol_fees/token0",
+            "protocol_fees_accrued/token0",
             &change.old_value,
             &change.new_value,
             TOKEN0_OFFSET,
         );
         push_protocol_fee_attribute(
             &mut attributes,
-            "protocol_fees/token1",
+            "protocol_fees_accrued/token1",
             &change.old_value,
             &change.new_value,
             TOKEN1_OFFSET,
@@ -109,9 +109,9 @@ mod tests {
         );
 
         assert_eq!(attributes.len(), 2);
-        assert_eq!(attributes[0].name, "protocol_fees/token0");
+        assert_eq!(attributes[0].name, "protocol_fees_accrued/token0");
         assert_eq!(BigInt::from_signed_bytes_be(&attributes[0].value), BigInt::from(3));
-        assert_eq!(attributes[1].name, "protocol_fees/token1");
+        assert_eq!(attributes[1].name, "protocol_fees_accrued/token1");
         assert_eq!(BigInt::from_signed_bytes_be(&attributes[1].value), BigInt::from(4));
     }
 
@@ -135,7 +135,7 @@ mod tests {
         );
 
         assert_eq!(attributes.len(), 1);
-        assert_eq!(attributes[0].name, "protocol_fees/token0");
+        assert_eq!(attributes[0].name, "protocol_fees_accrued/token0");
         assert_eq!(BigInt::from_signed_bytes_be(&attributes[0].value), BigInt::from(3));
     }
 }

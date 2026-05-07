@@ -1,0 +1,33 @@
+specVersion: v0.1.0
+package:
+    name: "base_uniswap_v3_logs_with_fees"
+    version: v0.1.0
+    url: "https://github.com/propeller-heads/tycho-indexer/tree/main/protocols/substreams/ethereum-uniswap-v3-logs-with-fees"
+
+imports:
+    v3_logs: ../ethereum-uniswap-v3-logs-only/base-uniswap-v3-logs-only-v0.1.2.spkg
+    # v3_logs: ../ethereum-uniswap-v3-logs-only/base-uniswap-v3.yaml
+
+binaries:
+    default:
+        type: wasm/rust-v1
+        file: ../target/wasm32-unknown-unknown/release/ethereum_uniswap_v3_logs_with_fees.wasm
+
+modules:
+    - name: map_protocol_fee_changes
+      kind: map
+      initialBlock: 43005492
+      inputs:
+          - source: sf.ethereum.type.v2.Block
+          - store: v3_logs:store_pools
+      output:
+          type: proto:tycho.evm.v1.BlockChanges
+
+    - name: map_protocol_changes_with_fees
+      kind: map
+      initialBlock: 1371680
+      inputs:
+          - map: v3_logs:map_protocol_changes
+          - map: map_protocol_fee_changes
+      output:
+          type: proto:tycho.evm.v1.BlockChanges

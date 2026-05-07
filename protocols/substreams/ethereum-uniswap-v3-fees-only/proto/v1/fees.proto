@@ -1,7 +1,0 @@
-syntax = "proto3";
-
-package tycho.evm.uniswap.v3.fees;
-
-message ProtocolFeePoolCandidates {
-  repeated bytes pool_addresses = 1;
-}

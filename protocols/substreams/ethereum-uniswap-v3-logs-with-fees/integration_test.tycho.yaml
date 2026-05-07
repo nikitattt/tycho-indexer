@@ -1,0 +1,12 @@
+substreams_yaml_path: ./base-uniswap-v3.yaml
+protocol_system: "base_uniswap_v3_logs_with_fees"
+protocol_type_names:
+    - "uniswap_v3_pool"
+module_name: "map_protocol_changes_with_fees"
+skip_balance_check: true
+initialized_accounts:
+tests:
+    - name: test_base_protocol_fee_changes_with_parent_data
+      start_block: 43186962
+      stop_block: 43189231
+      expected_components: []

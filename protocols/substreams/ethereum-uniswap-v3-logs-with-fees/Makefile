@@ -1,4 +1,4 @@
-BUILD_TARGET=ethereum_uniswap_v3_fees_only
+BUILD_TARGET=ethereum_uniswap_v3_logs_with_fees
 SUBSTREAMS_YAML=base-uniswap-v3.yaml
 
 .PHONY: build

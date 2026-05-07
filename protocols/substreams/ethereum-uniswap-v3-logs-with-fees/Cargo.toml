@@ -1,10 +1,10 @@
 [package]
-name = "ethereum-uniswap-v3-fees-only"
+name = "ethereum-uniswap-v3-logs-with-fees"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "ethereum_uniswap_v3_fees_only"
+name = "ethereum_uniswap_v3_logs_with_fees"
 crate-type = ["cdylib"]
 
 [dependencies]

@@ -24,7 +24,7 @@ members = [
     "ethereum-balancer-v3",
     "ethereum-fluid",
     "base-aerodrome-slipstreams",
-    "ethereum-uniswap-v3-fees-only",
+    "ethereum-uniswap-v3-logs-with-fees",
     "ethereum-erc4626",
     "ethereum-rocketpool",
     "unichain-velodrome",
