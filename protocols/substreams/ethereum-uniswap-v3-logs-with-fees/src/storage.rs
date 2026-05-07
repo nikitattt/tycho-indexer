@@ -10,29 +10,27 @@ const TOKEN0_OFFSET: usize = 0;
 const TOKEN1_OFFSET: usize = 16;
 const PROTOCOL_FEE_BYTES: usize = 16;
 
-pub fn protocol_fee_attributes(storage_changes: &[StorageChange], pool: &[u8]) -> Vec<Attribute> {
+pub fn protocol_fee_attributes(change: &StorageChange) -> Vec<Attribute> {
     let mut attributes = Vec::new();
 
-    for change in storage_changes {
-        if change.address != pool || change.key != PROTOCOL_FEES_SLOT {
-            continue;
-        }
-
-        push_protocol_fee_attribute(
-            &mut attributes,
-            "protocol_fees_accrued/token0",
-            &change.old_value,
-            &change.new_value,
-            TOKEN0_OFFSET,
-        );
-        push_protocol_fee_attribute(
-            &mut attributes,
-            "protocol_fees_accrued/token1",
-            &change.old_value,
-            &change.new_value,
-            TOKEN1_OFFSET,
-        );
+    if change.key != PROTOCOL_FEES_SLOT {
+        return attributes;
     }
+
+    push_protocol_fee_attribute(
+        &mut attributes,
+        "protocol_fees_accrued/token0",
+        &change.old_value,
+        &change.new_value,
+        TOKEN0_OFFSET,
+    );
+    push_protocol_fee_attribute(
+        &mut attributes,
+        "protocol_fees_accrued/token1",
+        &change.old_value,
+        &change.new_value,
+        TOKEN1_OFFSET,
+    );
 
     attributes
 }
@@ -97,16 +95,13 @@ mod tests {
         let new_value =
             hex!("0000000000000000000000000000000400000000000000000000000000000003").to_vec();
 
-        let attributes = protocol_fee_attributes(
-            &[StorageChange {
-                address: pool.clone(),
-                key: PROTOCOL_FEES_SLOT.to_vec(),
-                old_value,
-                new_value,
-                ..Default::default()
-            }],
-            &pool,
-        );
+        let attributes = protocol_fee_attributes(&StorageChange {
+            address: pool.clone(),
+            key: PROTOCOL_FEES_SLOT.to_vec(),
+            old_value,
+            new_value,
+            ..Default::default()
+        });
 
         assert_eq!(attributes.len(), 2);
         assert_eq!(attributes[0].name, "protocol_fees_accrued/token0");
@@ -123,16 +118,13 @@ mod tests {
         let new_value =
             hex!("0000000000000000000000000000000200000000000000000000000000000003").to_vec();
 
-        let attributes = protocol_fee_attributes(
-            &[StorageChange {
-                address: pool.clone(),
-                key: PROTOCOL_FEES_SLOT.to_vec(),
-                old_value,
-                new_value,
-                ..Default::default()
-            }],
-            &pool,
-        );
+        let attributes = protocol_fee_attributes(&StorageChange {
+            address: pool.clone(),
+            key: PROTOCOL_FEES_SLOT.to_vec(),
+            old_value,
+            new_value,
+            ..Default::default()
+        });
 
         assert_eq!(attributes.len(), 1);
         assert_eq!(attributes[0].name, "protocol_fees_accrued/token0");
