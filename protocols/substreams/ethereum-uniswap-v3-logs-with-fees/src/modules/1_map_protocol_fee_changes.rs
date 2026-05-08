@@ -4,7 +4,7 @@ use itertools::Itertools;
 use substreams::store::{StoreGet, StoreGetProto};
 use substreams_ethereum::pb::eth::v2 as eth;
 use tycho_substreams::prelude::{
-    BlockChanges, EntityChanges, Transaction, TransactionChangesBuilder,
+    Attribute, BlockChanges, EntityChanges, Transaction, TransactionChangesBuilder,
 };
 
 use crate::{
@@ -18,7 +18,7 @@ pub fn map_protocol_fee_changes(
     block: eth::Block,
     pools_store: StoreGetProto<Pool>,
 ) -> Result<BlockChanges, substreams::errors::Error> {
-    let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
+    let mut latest_attributes: HashMap<(Vec<u8>, String), PendingAttribute> = HashMap::new();
     let mut known_pools: HashMap<Vec<u8>, bool> = HashMap::new();
 
     for tx in block.transactions() {
@@ -54,15 +54,34 @@ pub fn map_protocol_fee_changes(
                 continue;
             }
 
-            let builder = transaction_changes
-                .entry(tycho_tx.index)
-                .or_insert_with(|| TransactionChangesBuilder::new(&tycho_tx));
-
-            builder.add_entity_change(&EntityChanges {
-                component_id: format!("0x{}", hex::encode(pool)),
-                attributes,
-            });
+            for attribute in attributes {
+                let key = (pool.clone(), attribute.name.clone());
+                latest_attributes.insert(
+                    key,
+                    PendingAttribute {
+                        tx: tycho_tx.clone(),
+                        pool: pool.clone(),
+                        attribute,
+                        order: (tycho_tx.index, storage_change.ordinal),
+                    },
+                );
+            }
         }
+    }
+
+    let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
+    for pending in latest_attributes
+        .into_values()
+        .sorted_unstable_by_key(|pending| pending.order)
+    {
+        let builder = transaction_changes
+            .entry(pending.tx.index)
+            .or_insert_with(|| TransactionChangesBuilder::new(&pending.tx));
+
+        builder.add_entity_change(&EntityChanges {
+            component_id: format!("0x{}", hex::encode(pending.pool)),
+            attributes: vec![pending.attribute],
+        });
     }
 
     Ok(BlockChanges {
@@ -90,4 +109,11 @@ fn is_known_pool(
         .is_some();
     known_pools.insert(address.to_vec(), is_known);
     is_known
+}
+
+struct PendingAttribute {
+    tx: Transaction,
+    pool: Vec<u8>,
+    attribute: Attribute,
+    order: (u64, u64),
 }

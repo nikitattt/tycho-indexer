@@ -4,7 +4,8 @@ use itertools::Itertools;
 use substreams::store::{StoreGet, StoreGetProto};
 use substreams_ethereum::pb::eth::v2 as eth;
 use tycho_substreams::prelude::{
-    Block as TychoBlock, BlockChanges, EntityChanges, Transaction, TransactionChangesBuilder,
+    Attribute, Block as TychoBlock, BlockChanges, EntityChanges, Transaction,
+    TransactionChangesBuilder,
 };
 
 use crate::{modules::pool_key, pb::uniswap::v2::Pool, storage::v2_extra_attribute};
@@ -25,7 +26,7 @@ fn collect_v2_extra_changes<F>(block: eth::Block, mut is_known_pool: F) -> Block
 where
     F: FnMut(&[u8]) -> bool,
 {
-    let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
+    let mut latest_attributes: HashMap<(Vec<u8>, String), PendingAttribute> = HashMap::new();
     let mut known_pools: HashMap<Vec<u8>, bool> = HashMap::new();
 
     for tx in block.transaction_traces.iter() {
@@ -65,12 +66,31 @@ where
             };
             let component_id = format!("0x{}", hex::encode(&storage_change.address));
 
-            let builder = transaction_changes
-                .entry(tycho_tx.index)
-                .or_insert_with(|| TransactionChangesBuilder::new(&tycho_tx));
-
-            builder.add_entity_change(&EntityChanges { component_id, attributes: vec![attribute] });
+            latest_attributes.insert(
+                (storage_change.address.clone(), attribute.name.clone()),
+                PendingAttribute {
+                    tx: tycho_tx.clone(),
+                    component_id,
+                    attribute,
+                    order: (tycho_tx.index, storage_change.ordinal),
+                },
+            );
         }
+    }
+
+    let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
+    for pending in latest_attributes
+        .into_values()
+        .sorted_unstable_by_key(|pending| pending.order)
+    {
+        let builder = transaction_changes
+            .entry(pending.tx.index)
+            .or_insert_with(|| TransactionChangesBuilder::new(&pending.tx));
+
+        builder.add_entity_change(&EntityChanges {
+            component_id: pending.component_id,
+            attributes: vec![pending.attribute],
+        });
     }
 
     BlockChanges {
@@ -117,6 +137,13 @@ where
     let is_known = is_known_pool(address);
     known_pools.insert(address.to_vec(), is_known);
     is_known
+}
+
+struct PendingAttribute {
+    tx: Transaction,
+    component_id: String,
+    attribute: Attribute,
+    order: (u64, u64),
 }
 
 #[cfg(test)]

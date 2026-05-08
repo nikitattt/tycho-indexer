@@ -1,7 +1,7 @@
 specVersion: v0.1.0
 package:
     name: "base_uniswap_v2_with_extra"
-    version: v0.1.0
+    version: v0.1.1
 
 imports:
     v2: ./spkg/base-uniswap-v2-v0.3.2.spkg
