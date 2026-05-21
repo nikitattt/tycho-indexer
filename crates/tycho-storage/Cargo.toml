@@ -1,0 +1,35 @@
+[package]
+name = "tycho-storage"
+version.workspace = true
+edition.workspace = true
+description = "Tycho Postgres SQL storage backend implementation"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+license.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+chrono.workspace = true
+tycho-common = { workspace = true, features = ["diesel"] }
+diesel.workspace = true
+diesel-async.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+unicode-segmentation.workspace = true
+lru.workspace = true
+diesel-derive-enum = { version = "2.1.0", features = ["postgres"] }
+diesel_migrations = "2.1.0"
+itertools = "0.12.1"
+lazy_static = "1.4.0"
+
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+rstest.workspace = true
+test-log = { version = "0.2.14", features = ["trace"] }

@@ -77,9 +77,11 @@ Temporary Items
 *.spkg
 # Except the test spkg
 !tycho-indexer/test/spkg/*
-!railway/substreams/**/*.spkg
 
 .env
+.substreams.env
+
+*/.env
 .vscode
 .idea
 *.log

@@ -8,7 +8,7 @@ description: Simulate interactions with any protocol.
 
 Tycho Simulation is a Rust crate that provides powerful tools for **interacting with protocol states**, **calculating spot prices**, and **simulating token swaps**.
 
-The repository is available [here](https://github.com/propeller-heads/tycho-simulation).
+The crate lives at [`crates/tycho-simulation`](https://github.com/propeller-heads/tycho-indexer/tree/main/crates/tycho-simulation) inside the [Tycho monorepo](https://github.com/propeller-heads/tycho-indexer).
 
 {% hint style="info" %}
 **✨ New: Sub-Second Latency with Partial Blocks**
@@ -18,13 +18,13 @@ Tycho now provides early support for partial blocks on Base, enabling sub-second
 
 ## Installation
 
-The `tycho-simulation` package is available on [Github](https://github.com/propeller-heads/tycho-simulation).
+The `tycho-simulation` package is available on [Github](https://github.com/propeller-heads/tycho-indexer).
 
 To use the simulation tools with Ethereum Virtual Machine (EVM) chains, add the optional `evm` feature flag to your dependency configuration:
 
 ```toml
 tycho-simulation = { 
-     git = "https://github.com/propeller-heads/tycho-simulation.git",
+     git = "https://github.com/propeller-heads/tycho-indexer.git",
      package = "tycho-simulation",
      tag = "x.y.z", # Replace with latest version
      features = ["evm"]
@@ -35,12 +35,12 @@ tycho-simulation = {
 Add this to your project's `Cargo.toml` file.
 
 {% hint style="info" %}
-**Note:** Replace `x.y.z` with the latest version number from our [GitHub Releases page](https://github.com/propeller-heads/tycho-simulation/releases). Using the latest release ensures you have the most up-to-date features and bug fixes.
+**Note:** Replace `x.y.z` with the latest version number from our [GitHub Releases page](https://github.com/propeller-heads/tycho-indexer/releases). Using the latest release ensures you have the most up-to-date features and bug fixes.
 {% endhint %}
 
 ## Main Interface
 
-All protocols implement the `ProtocolSim` trait (see definition [here](https://github.com/propeller-heads/tycho-simulation/blob/e588151d25a6d8070f7813b4ea8608329d221ab2/src/protocol/state.rs#L66)). It has the main methods:
+All protocols implement the `ProtocolSim` trait (see definition [here](https://github.com/propeller-heads/tycho-indexer/blob/main/crates/tycho-simulation/src/protocol/state.rs)). It has the main methods:
 
 #### Spot price
 
@@ -75,7 +75,7 @@ pub struct GetAmountOutResult {
 
 `new state` allows you to, for example, simulate consecutive swaps in the same protocol.
 
-Please refer to the [in-code documentation](../../tycho-common/src/simulation/protocol_sim.rs#L116) of the `ProtocolSim` trait and its methods for more in-depth information.
+Please refer to the [in-code documentation](https://github.com/propeller-heads/tycho-indexer/blob/main/crates/tycho-common/src/simulation/protocol_sim.rs) of the `ProtocolSim` trait and its methods for more in-depth information.
 
 #### Fee
 
@@ -159,7 +159,7 @@ To maintain up-to-date states of the protocols you wish to simulate over, you ca
 
 #### Step 1: Fetch tokens
 
-It is necessary to collect all tokens you are willing to support/swap over as this must be set on the stream builder in step 2. You can either set up custom logic to define this, or use the Tycho Indexer RPC to fetch and filter for tokens of interest. To simplify this, a util function called `load_all_tokens`is supplied and can be used as follows:
+Collect token metadata up front and pass it to the stream builder in step 2. This token set is used to decode startup snapshots and initialize protocol states correctly. To simplify this, a util function called `load_all_tokens` is supplied and can be used as follows:
 
 ```rust
 use tycho_simulation::utils::load_all_tokens;
@@ -177,7 +177,7 @@ let all_tokens = load_all_tokens(
 
 #### Step 2: Create a stream
 
-You can use the [ProtocolStreamBuilder](https://github.com/propeller-heads/tycho-simulation/blob/main/src/evm/stream.rs#L55) to easily set up and manage multiple protocols within one stream. An example of creating such a stream with Uniswap V2 and Balancer V2 protocols is as follows:
+You can use the [ProtocolStreamBuilder](https://github.com/propeller-heads/tycho-indexer/blob/main/crates/tycho-simulation/src/evm/stream.rs) to easily set up and manage multiple protocols within one stream. An example of creating such a stream with Uniswap V2 and Balancer V2 protocols is as follows:
 
 ```rust
 use tycho_simulation::evm::{
@@ -201,6 +201,8 @@ let mut protocol_stream = ProtocolStreamBuilder::new("tycho-beta.propellerheads.
     .expect("Failed building protocol stream");
 ```
 
+`set_tokens(...)` does **not** act as an ongoing stream filter. New snapshots/components streamed later include the token metadata required for decoding.
+
 Some protocols, such as Balancer V2 and Curve, require a pool filter to be defined to filter out unsupported pools. If a protocol needs a pool filter and the user does not provide one, a warning will be raised during the stream setup process.
 
 The stream created emits `Update` messages which consist of:
@@ -211,6 +213,8 @@ The stream created emits `Update` messages which consist of:
 * `states`- the updated `ProtocolSim` states for all components modified in this block
 
 The first message received will contain states for all protocol components registered to. Thereafter, further block updates will only contain data for updated or new components.
+
+If you want to restrict processing to specific tokens (for example USDC/WETH only), apply that filter in your own consumer logic when reading `new_pairs` and `states`.
 
 > Note: For efficiency, `ProtocolSim` states contain simulation-critical data only. Reference data such as protocol names and token information is provided in the `ProtocolComponent` objects within the `new_pairs` field. Consider maintaining a store of these components if you need this metadata.
 
@@ -284,7 +288,7 @@ let mut amount_out = HashMap::new()
 
 ## Example Use Case: Token Price Printer
 
-You can find an example of a **price printer** [here](https://github.com/propeller-heads/tycho-simulation/tree/main/examples).
+You can find an example of a **price printer** [here](https://github.com/propeller-heads/tycho-indexer/tree/main/crates/tycho-simulation/examples).
 
 Clone the repo, then run:
 

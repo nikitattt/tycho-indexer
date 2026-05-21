@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "ethereum-cowamm",
+    "ethereum-balancer-v2",
+    "ethereum-curve",
+    "crates/tycho-substreams",
+    "crates/substreams-helper",
+    "ethereum-ambient",
+    "ethereum-uniswap-v2",
+    "ethereum-uniswap-v3",
+    "ethereum-pancakeswap-v3",
+    "ethereum-sfrax",
+    "ethereum-sfraxeth",
+    "ethereum-uniswap-v3-logs-only",
+    "ethereum-template-factory",
+    "ethereum-template-singleton",
+    "ethereum-uniswap-v4/shared",
+    "ethereum-uniswap-v4/no-hooks",
+    "ethereum-uniswap-v4/with-hooks",
+    "ethereum-ekubo-v2",
+    "ethereum-ekubo-v3",
+    "ethereum-maverick-v2",
+    "ethereum-lido",
+    "ethereum-balancer-v3",
+    "ethereum-fluid",
+    "base-aerodrome-slipstreams",
+    "ethereum-erc4626",
+    "ethereum-rocketpool",
+    "unichain-velodrome",
+    "ethereum-liquidityparty",
+]
+resolver = "2"
+
+[profile.release]
+lto = true
+opt-level = 's'
+strip = "debuginfo"
