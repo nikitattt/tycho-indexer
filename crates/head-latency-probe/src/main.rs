@@ -25,9 +25,6 @@
 //!   --samples 100
 //! ```
 
-mod pb;
-mod substreams;
-
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
@@ -42,7 +39,7 @@ use std::{
 use anyhow::{anyhow, bail, Context};
 use chrono::{Local, TimeZone};
 use clap::{Parser, ValueEnum};
-use futures_util::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use serde_json::{json, Value};
 use tokio::{
@@ -51,8 +48,7 @@ use tokio::{
     time,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
-
-use crate::{
+use tycho_indexer::{
     pb::sf::substreams::{
         rpc::{
             v2::{response::Message as SubstreamsMessage, BlockScopedData},
@@ -154,6 +150,10 @@ struct ProbeEvent {
     lag_ms: Option<i64>,
     is_partial: bool,
     is_last_partial: bool,
+    output_module: Option<String>,
+    output_type_url: Option<String>,
+    output_bytes: Option<usize>,
+    has_output: Option<bool>,
 }
 
 #[derive(Default)]
@@ -231,6 +231,10 @@ struct CompareObservation {
     event_kind: &'static str,
     is_partial: bool,
     is_last_partial: bool,
+    output_module: Option<String>,
+    output_type_url: Option<String>,
+    output_bytes: Option<usize>,
+    has_output: Option<bool>,
 }
 
 #[derive(Default)]
@@ -355,10 +359,11 @@ impl Aggregator {
 
         if self.live_per_block && !self.compare_enabled {
             println!(
-                "{} - {} - {}",
+                "{} - {} - {}{}",
                 event.block_number,
                 event.source,
-                fmt_clock_ms(event.receive_time_ms)
+                fmt_clock_ms(event.receive_time_ms),
+                fmt_output_suffix(&event),
             );
         }
 
@@ -400,6 +405,10 @@ impl Aggregator {
                         observation.event_kind,
                         observation.is_partial,
                         observation.is_last_partial,
+                        observation.output_module,
+                        observation.output_type_url,
+                        observation.output_bytes,
+                        observation.has_output,
                         event.receive_time_ms,
                     )?;
                 }
@@ -422,6 +431,10 @@ impl Aggregator {
                                 event_kind: event.event_kind,
                                 is_partial: event.is_partial,
                                 is_last_partial: event.is_last_partial,
+                                output_module: event.output_module.clone(),
+                                output_type_url: event.output_type_url.clone(),
+                                output_bytes: event.output_bytes,
+                                has_output: event.has_output,
                             });
                     }
                     compare_state.rpc_receive_time_ms
@@ -438,6 +451,10 @@ impl Aggregator {
                             event.event_kind,
                             event.is_partial,
                             event.is_last_partial,
+                            event.output_module.clone(),
+                            event.output_type_url.clone(),
+                            event.output_bytes,
+                            event.has_output,
                             rpc_receive_time_ms,
                         )?;
                     }
@@ -472,6 +489,16 @@ impl Aggregator {
                 opt_i64(event.lag_ms),
                 bool_cell(event.is_partial),
                 bool_cell(event.is_last_partial),
+                event
+                    .output_module
+                    .clone()
+                    .unwrap_or_default(),
+                event
+                    .output_type_url
+                    .clone()
+                    .unwrap_or_default(),
+                opt_usize(event.output_bytes),
+                opt_bool(event.has_output),
                 String::new(),
                 String::new(),
                 String::new(),
@@ -491,6 +518,10 @@ impl Aggregator {
         event_kind: &'static str,
         is_partial: bool,
         is_last_partial: bool,
+        output_module: Option<String>,
+        output_type_url: Option<String>,
+        output_bytes: Option<usize>,
+        has_output: Option<bool>,
         rpc_receive_time_ms: i64,
     ) -> anyhow::Result<()> {
         let delta_vs_rpc_ms = receive_time_ms - rpc_receive_time_ms;
@@ -518,11 +549,12 @@ impl Aggregator {
 
         if self.live_per_block {
             println!(
-                "{} - {}ms (rpc={} substreams={})",
+                "{} - {}ms (rpc={} substreams={} output={})",
                 block_number,
                 delta_vs_rpc_ms,
                 fmt_clock_ms(rpc_receive_time_ms),
-                fmt_clock_ms(receive_time_ms)
+                fmt_clock_ms(receive_time_ms),
+                fmt_output(has_output, output_bytes)
             );
         }
 
@@ -542,6 +574,10 @@ impl Aggregator {
                 ),
                 bool_cell(is_partial),
                 bool_cell(is_last_partial),
+                output_module.unwrap_or_default(),
+                output_type_url.unwrap_or_default(),
+                opt_usize(output_bytes),
+                opt_bool(has_output),
                 rpc_receive_time_ms.to_string(),
                 delta_vs_rpc_ms.to_string(),
                 String::new(),
@@ -1000,7 +1036,7 @@ fn warn_if_missing_module_params(
             module.inputs.iter().any(|input| {
                 matches!(
                     input.input,
-                    Some(crate::pb::sf::substreams::v1::module::input::Input::Params(_))
+                    Some(tycho_indexer::pb::sf::substreams::v1::module::input::Input::Params(_))
                 )
             })
         })
@@ -1227,6 +1263,10 @@ fn substreams_message_to_event(
                 lag_ms: None,
                 is_partial: false,
                 is_last_partial: false,
+                output_module: None,
+                output_type_url: None,
+                output_bytes: None,
+                has_output: None,
             }));
         }
         _ => return Ok(None),
@@ -1251,6 +1291,7 @@ fn block_scoped_data_to_event(
         .as_ref()
         .map(timestamp_to_ms)
         .transpose()?;
+    let output_info = output_info(&data);
 
     Ok(ProbeEvent {
         source: source_name.to_string(),
@@ -1266,6 +1307,10 @@ fn block_scoped_data_to_event(
             .map(|block_time_ms| receive_time_ms - block_time_ms),
         is_partial: data.is_partial,
         is_last_partial: data.is_last_partial.unwrap_or(false),
+        output_module: output_info.module,
+        output_type_url: output_info.type_url,
+        output_bytes: Some(output_info.bytes),
+        has_output: Some(output_info.has_output),
     })
 }
 
@@ -1388,6 +1433,10 @@ fn rpc_message_to_event(
             .map(|block_time_ms| receive_time_ms - block_time_ms),
         is_partial: false,
         is_last_partial: false,
+        output_module: None,
+        output_type_url: None,
+        output_bytes: None,
+        has_output: None,
     }))
 }
 
@@ -1461,6 +1510,54 @@ fn lag_metric_keys(event: &ProbeEvent) -> Vec<String> {
     }
 }
 
+#[derive(Default)]
+struct OutputInfo {
+    module: Option<String>,
+    type_url: Option<String>,
+    bytes: usize,
+    has_output: bool,
+}
+
+fn output_info(data: &BlockScopedData) -> OutputInfo {
+    let Some(output) = data.output.as_ref() else {
+        return OutputInfo::default();
+    };
+
+    let module = (!output.name.is_empty()).then(|| output.name.clone());
+    let Some(map_output) = output.map_output.as_ref() else {
+        return OutputInfo { module, ..OutputInfo::default() };
+    };
+
+    let bytes = map_output.value.len();
+    OutputInfo {
+        module,
+        type_url: (!map_output.type_url.is_empty()).then(|| map_output.type_url.clone()),
+        bytes,
+        has_output: bytes > 0,
+    }
+}
+
+fn fmt_output_suffix(event: &ProbeEvent) -> String {
+    event
+        .has_output
+        .map(|has_output| {
+            format!(
+                " output={} bytes={}",
+                bool_cell(has_output),
+                event.output_bytes.unwrap_or_default()
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn fmt_output(has_output: Option<bool>, output_bytes: Option<usize>) -> String {
+    has_output
+        .map(|has_output| {
+            format!("{} bytes={}", bool_cell(has_output), output_bytes.unwrap_or_default())
+        })
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
 fn spawn_csv_writer(
     path: &Path,
 ) -> anyhow::Result<(mpsc::Sender<CsvMessage>, thread::JoinHandle<anyhow::Result<()>>)> {
@@ -1474,7 +1571,7 @@ fn spawn_csv_writer(
     let file = File::create(path).with_context(|| format!("create csv file {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     writer.write_all(
-        b"source,event_kind,block_number,block_hash,block_time_ms,receive_time_ms,lag_ms,is_partial,is_last_partial,rpc_receive_time_ms,delta_vs_rpc_ms,notes\n",
+        b"source,event_kind,block_number,block_hash,block_time_ms,receive_time_ms,lag_ms,is_partial,is_last_partial,output_module,output_type_url,output_bytes,has_output,rpc_receive_time_ms,delta_vs_rpc_ms,notes\n",
     )?;
 
     let (tx, rx) = mpsc::channel();
@@ -1561,6 +1658,16 @@ fn opt_i64(value: Option<i64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_default()
+}
+
+fn opt_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+}
+
+fn opt_bool(value: Option<bool>) -> String {
+    value.map(bool_cell).unwrap_or_default()
 }
 
 fn bool_cell(value: bool) -> String {

@@ -4413,6 +4413,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "head-latency-probe"
+version = "0.276.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "futures 0.3.31",
+ "prost 0.11.9",
+ "prost-types 0.11.9",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.20.1",
+ "tycho-indexer",
+]
+
+[[package]]
 name = "heck"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

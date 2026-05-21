@@ -7,6 +7,7 @@ members = [
     "crates/tycho-storage",
     "crates/tycho-ethereum",
     "crates/tycho-indexer",
+    "crates/head-latency-probe",
     "crates/tycho-simulation",
     "crates/tycho-test",
     "crates/tycho-integration-test",
