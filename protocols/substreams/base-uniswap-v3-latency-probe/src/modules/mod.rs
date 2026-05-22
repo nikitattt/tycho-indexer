@@ -1,11 +1,7 @@
-pub use map_pool_created::map_pools_created;
 pub use map_protocol_changes::map_protocol_changes;
 use substreams_ethereum::pb::eth::v2::TransactionTrace;
 
 use crate::pb::uniswap::v3::Transaction;
-
-#[path = "1_map_pool_created.rs"]
-mod map_pool_created;
 
 #[path = "3_map_events.rs"]
 mod map_events;

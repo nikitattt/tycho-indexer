@@ -19,7 +19,6 @@ const BASE_PROTOCOL_FEES_INITIAL_BLOCK: u64 = 43_005_492;
 #[substreams::handlers::map]
 pub fn map_protocol_changes(
     block: eth::Block,
-    created_pools: BlockEntityChanges,
     events: Events,
     balances_map_deltas: BlockBalanceDeltas,
     balances_store_deltas: StoreDeltas,
@@ -31,32 +30,6 @@ pub fn map_protocol_changes(
     // We merge contract changes by transaction (identified by transaction index) making it easy to
     //  sort them at the very end.
     let mut transaction_changes: HashMap<_, TransactionChangesBuilder> = HashMap::new();
-
-    // Add created pools to the tx_changes_map
-    for change in created_pools.changes.into_iter() {
-        let tx = change.tx.as_ref().unwrap();
-        let builder = transaction_changes
-            .entry(tx.index)
-            .or_insert_with(|| TransactionChangesBuilder::new(tx));
-        change
-            .component_changes
-            .iter()
-            .for_each(|c| {
-                builder.add_protocol_component(c);
-            });
-        change
-            .entity_changes
-            .iter()
-            .for_each(|ec| {
-                builder.add_entity_change(ec);
-            });
-        change
-            .balance_changes
-            .iter()
-            .for_each(|bc| {
-                builder.add_balance_change(bc);
-            });
-    }
 
     // Balance changes are gathered by the `StoreDelta` based on `PoolBalanceChanged` creating
     //  `BlockBalanceDeltas`. We essentially just process the changes that occurred to the `store`

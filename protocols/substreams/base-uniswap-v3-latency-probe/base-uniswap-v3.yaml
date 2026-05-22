@@ -22,17 +22,9 @@ binaries:
         file: ../target/wasm32-unknown-unknown/release/base_uniswap_v3_latency_probe.wasm
 
 modules:
-    - name: map_pools_created
-      kind: map
-      initialBlock: 43005492
-      inputs:
-          - source: sf.ethereum.type.v2.Block
-      output:
-          type: proto:tycho.evm.v1.BlockEntityChanges
-
     - name: map_events
       kind: map
-      initialBlock: 43005492
+      initialBlock: 46344200
       inputs:
           - source: sf.ethereum.type.v2.Block
       output:
@@ -40,7 +32,7 @@ modules:
 
     - name: map_balance_changes
       kind: map
-      initialBlock: 43005492
+      initialBlock: 46344200
       inputs:
           - map: map_events
       output:
@@ -48,7 +40,7 @@ modules:
 
     - name: store_pools_balances
       kind: store
-      initialBlock: 43005492
+      initialBlock: 46344200
       updatePolicy: add
       valueType: bigint
       inputs:
@@ -56,7 +48,7 @@ modules:
 
     - name: map_ticks_changes
       kind: map
-      initialBlock: 43005492
+      initialBlock: 46344200
       inputs:
           - map: map_events
       output:
@@ -64,7 +56,7 @@ modules:
 
     - name: store_ticks_liquidity
       kind: store
-      initialBlock: 43005492
+      initialBlock: 46344200
       updatePolicy: add
       valueType: bigint
       inputs:
@@ -72,7 +64,7 @@ modules:
 
     - name: store_pool_current_tick
       kind: store
-      initialBlock: 43005492
+      initialBlock: 46344200
       updatePolicy: set
       valueType: int64
       inputs:
@@ -80,7 +72,7 @@ modules:
 
     - name: map_liquidity_changes
       kind: map
-      initialBlock: 43005492
+      initialBlock: 46344200
       inputs:
           - map: map_events
           - store: store_pool_current_tick
@@ -89,7 +81,7 @@ modules:
 
     - name: store_liquidity
       kind: store
-      initialBlock: 43005492
+      initialBlock: 46344200
       updatePolicy: set_sum
       valueType: bigint
       inputs:
@@ -97,10 +89,9 @@ modules:
 
     - name: map_protocol_changes
       kind: map
-      initialBlock: 43005492
+      initialBlock: 46344200
       inputs:
           - source: sf.ethereum.type.v2.Block
-          - map: map_pools_created
           - map: map_events
           - map: map_balance_changes
           - store: store_pools_balances
