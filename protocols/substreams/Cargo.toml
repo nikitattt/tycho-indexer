@@ -13,6 +13,7 @@ members = [
     "ethereum-sfraxeth",
     "ethereum-uniswap-v3-logs-only",
     "ethereum-uniswap-v3-fees",
+    "base-uniswap-v3-latency-probe",
     "ethereum-template-factory",
     "ethereum-template-singleton",
     "ethereum-uniswap-v2-with-extra",
