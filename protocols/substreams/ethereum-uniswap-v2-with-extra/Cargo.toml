@@ -1,0 +1,20 @@
+[package]
+name = "ethereum-uniswap-v2-with-extra"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ethereum_uniswap_v2_with_extra"
+crate-type = ["cdylib"]
+
+[dependencies]
+hex = "0.4.3"
+hex-literal = "0.4.1"
+itertools = "0.13.0"
+prost = "0.11"
+substreams = "0.5.22"
+substreams-ethereum = "0.9.9"
+tycho-substreams = { path = "../crates/tycho-substreams" }
+
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = { version = "0.2", features = ["custom"] }
