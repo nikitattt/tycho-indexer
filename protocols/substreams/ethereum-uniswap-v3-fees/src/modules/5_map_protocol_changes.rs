@@ -342,7 +342,7 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
                     .into(),
                 hex::decode(&event.pool_address).unwrap(),
                 Attribute {
-                    name: "protocol_fees/token0".to_string(),
+                    name: "fee_protocol/token0".to_string(),
                     value: BigInt::from(sfp.fee_protocol_0_new).to_signed_bytes_be(),
                     change: ChangeType::Update.into(),
                 },
@@ -351,7 +351,7 @@ fn event_to_attributes_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddres
                 event.transaction.unwrap().into(),
                 hex::decode(event.pool_address).unwrap(),
                 Attribute {
-                    name: "protocol_fees/token1".to_string(),
+                    name: "fee_protocol/token1".to_string(),
                     value: BigInt::from(sfp.fee_protocol_1_new).to_signed_bytes_be(),
                     change: ChangeType::Update.into(),
                 },
