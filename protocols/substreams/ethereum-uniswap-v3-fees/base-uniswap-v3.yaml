@@ -70,7 +70,6 @@ modules:
       inputs:
           - source: sf.ethereum.type.v2.Block
           - map: map_events
-          - store: store_pools
       output:
           type: proto:tycho.evm.v1.BlockEntityChanges
 

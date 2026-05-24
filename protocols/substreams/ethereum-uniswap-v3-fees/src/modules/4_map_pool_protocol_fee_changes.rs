@@ -1,11 +1,9 @@
 use crate::{
-    modules::pool_key,
-    pb::uniswap::v3::{Events, Pool},
+    pb::uniswap::v3::Events,
     storage::{protocol_fee_attributes, PROTOCOL_FEES_SLOT},
 };
 use itertools::Itertools;
-use std::collections::{HashMap, HashSet};
-use substreams::store::{StoreGet, StoreGetProto};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use substreams_ethereum::pb::eth::v2 as eth;
 use substreams_helper::hex::Hexable;
 use tycho_substreams::prelude::*;
@@ -16,36 +14,16 @@ const BASE_PROTOCOL_FEES_INITIAL_BLOCK: u64 = 43_005_492;
 pub fn map_pool_protocol_fee_changes(
     block: eth::Block,
     events: Events,
-    pools_store: StoreGetProto<Pool>,
 ) -> Result<BlockEntityChanges, substreams::errors::Error> {
-    Ok(collect_pool_protocol_fee_changes(&block, events, |address| {
-        pools_store.get_last(pool_key(address))
-    }))
+    Ok(collect_pool_protocol_fee_changes(&block, events))
 }
 
-fn collect_pool_protocol_fee_changes<F>(
-    block: &eth::Block,
-    events: Events,
-    mut lookup_pool: F,
-) -> BlockEntityChanges
-where
-    F: FnMut(&[u8]) -> Option<Pool>,
-{
+fn collect_pool_protocol_fee_changes(block: &eth::Block, events: Events) -> BlockEntityChanges {
     let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
 
     if block.number >= BASE_PROTOCOL_FEES_INITIAL_BLOCK {
-        let event_known_pools = events
-            .pool_events
-            .iter()
-            .filter_map(|event| hex::decode(&event.pool_address).ok())
-            .collect::<HashSet<_>>();
-
-        add_protocol_fee_changes(
-            block,
-            &event_known_pools,
-            &mut lookup_pool,
-            &mut transaction_changes,
-        );
+        let event_pools_by_tx = event_pools_by_tx(&events);
+        add_protocol_fee_changes(block, &event_pools_by_tx, &mut transaction_changes);
     }
 
     BlockEntityChanges {
@@ -64,34 +42,45 @@ where
     }
 }
 
-fn add_protocol_fee_changes<F>(
+fn event_pools_by_tx(events: &Events) -> HashMap<u64, HashSet<Vec<u8>>> {
+    let mut pools_by_tx = HashMap::new();
+
+    for event in &events.pool_events {
+        let Some(tx) = &event.transaction else {
+            continue;
+        };
+        let Ok(pool) = hex::decode(
+            event
+                .pool_address
+                .trim_start_matches("0x"),
+        ) else {
+            continue;
+        };
+
+        pools_by_tx
+            .entry(tx.index)
+            .or_insert_with(HashSet::new)
+            .insert(pool);
+    }
+
+    pools_by_tx
+}
+
+fn add_protocol_fee_changes(
     block: &eth::Block,
-    event_known_pools: &HashSet<Vec<u8>>,
-    lookup_pool: &mut F,
+    event_pools_by_tx: &HashMap<u64, HashSet<Vec<u8>>>,
     transaction_changes: &mut HashMap<u64, TransactionChangesBuilder>,
-) where
-    F: FnMut(&[u8]) -> Option<Pool>,
-{
+) {
     let mut latest_attributes: HashMap<(Vec<u8>, String), PendingAttribute> = HashMap::new();
-    let mut known_pools: HashMap<Vec<u8>, bool> = HashMap::new();
 
     for tx in block.transactions() {
         if tx.status != 1 {
             continue;
         }
 
-        let mut protocol_fee_storage_changes = tx
-            .calls()
-            .filter(|call_view| !call_view.call.state_reverted)
-            .flat_map(|call_view| call_view.call.storage_changes.iter())
-            .filter(|change| change.key == PROTOCOL_FEES_SLOT)
-            .collect::<Vec<_>>();
-
-        if protocol_fee_storage_changes.is_empty() {
+        let Some(event_pools) = event_pools_by_tx.get(&(tx.index as u64)) else {
             continue;
-        }
-
-        protocol_fee_storage_changes.sort_unstable_by_key(|change| change.ordinal);
+        };
 
         let tycho_tx = Transaction {
             hash: tx.hash.clone(),
@@ -100,20 +89,27 @@ fn add_protocol_fee_changes<F>(
             index: tx.index.into(),
         };
 
-        for storage_change in protocol_fee_storage_changes {
+        for storage_change in tx
+            .calls()
+            .filter(|call_view| {
+                !call_view.call.state_reverted
+                    && event_pools.contains(call_view.call.address.as_slice())
+            })
+            .flat_map(|call_view| call_view.call.storage_changes.iter())
+            .filter(|change| {
+                change.key == PROTOCOL_FEES_SLOT && event_pools.contains(change.address.as_slice())
+            })
+        {
             let pool = &storage_change.address;
             let attributes = protocol_fee_attributes(storage_change);
 
-            if attributes.is_empty()
-                || !is_known_pool(pool, event_known_pools, lookup_pool, &mut known_pools)
-            {
+            if attributes.is_empty() {
                 continue;
             }
 
             for attribute in attributes {
-                let key = (pool.clone(), attribute.name.clone());
-                latest_attributes.insert(
-                    key,
+                upsert_latest_attribute(
+                    &mut latest_attributes,
                     PendingAttribute {
                         tx: tycho_tx.clone(),
                         pool: pool.clone(),
@@ -133,26 +129,22 @@ fn add_protocol_fee_changes<F>(
     }
 }
 
-fn is_known_pool<F>(
-    address: &[u8],
-    event_known_pools: &HashSet<Vec<u8>>,
-    lookup_pool: &mut F,
-    known_pools: &mut HashMap<Vec<u8>, bool>,
-) -> bool
-where
-    F: FnMut(&[u8]) -> Option<Pool>,
-{
-    if event_known_pools.contains(address) {
-        return true;
-    }
+fn upsert_latest_attribute(
+    latest_attributes: &mut HashMap<(Vec<u8>, String), PendingAttribute>,
+    pending: PendingAttribute,
+) {
+    let key = (pending.pool.clone(), pending.attribute.name.clone());
 
-    if let Some(is_known) = known_pools.get(address) {
-        return *is_known;
+    match latest_attributes.entry(key) {
+        Entry::Occupied(mut entry) => {
+            if pending.order > entry.get().order {
+                entry.insert(pending);
+            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(pending);
+        }
     }
-
-    let is_known = lookup_pool(address).is_some();
-    known_pools.insert(address.to_vec(), is_known);
-    is_known
 }
 
 fn add_pool_attribute(
@@ -198,42 +190,105 @@ mod tests {
     fn emits_protocol_fee_storage_attributes_for_event_known_pool_without_store_lookup() {
         let pool = pool_address(1);
         let storage_change = protocol_fee_storage_change(pool_bytes(1), 10, 1, 2, 3, 4);
-        let events = Events { pool_events: vec![swap_event(pool.clone(), 9)] };
-        let mut lookups = 0;
+        let events = Events { pool_events: vec![swap_event(pool.clone(), 1)] };
 
         let changes = collect_pool_protocol_fee_changes(
             &block(43_005_492, vec![tx_trace(1, vec![storage_change])]),
             events,
-            |_| {
-                lookups += 1;
-                None
-            },
         );
         let attrs = attributes_for_pool(&changes, &pool);
 
-        assert_eq!(lookups, 0);
         assert_eq!(attr_value(&attrs, "protocol_fees/token0"), BigInt::from(3));
         assert_eq!(attr_value(&attrs, "protocol_fees/token1"), BigInt::from(4));
     }
 
     #[test]
-    fn uses_store_lookup_for_fee_storage_without_matching_event_and_caches_misses() {
+    fn ignores_fee_storage_without_matching_pool_event() {
         let unknown_pool = pool_bytes(9);
         let storage_change = protocol_fee_storage_change(unknown_pool.clone(), 10, 1, 2, 3, 4);
         let events = Events { pool_events: vec![] };
-        let mut lookups = 0;
 
         let changes = collect_pool_protocol_fee_changes(
             &block(43_005_492, vec![tx_trace(1, vec![storage_change.clone(), storage_change])]),
             events,
-            |_| {
-                lookups += 1;
-                None::<Pool>
-            },
         );
 
-        assert_eq!(lookups, 1);
         assert!(changes.changes.is_empty());
+    }
+
+    #[test]
+    fn keeps_latest_protocol_fee_attribute_by_transaction_and_ordinal() {
+        let pool = pool_address(1);
+        let events = Events { pool_events: vec![swap_event(pool.clone(), 1)] };
+
+        let changes = collect_pool_protocol_fee_changes(
+            &block(
+                43_005_492,
+                vec![tx_trace(
+                    1,
+                    vec![
+                        protocol_fee_storage_change(pool_bytes(1), 12, 3, 4, 7, 8),
+                        protocol_fee_storage_change(pool_bytes(1), 10, 1, 2, 3, 4),
+                    ],
+                )],
+            ),
+            events,
+        );
+        let attrs = attributes_for_pool(&changes, &pool);
+
+        assert_eq!(attr_value(&attrs, "protocol_fees/token0"), BigInt::from(7));
+        assert_eq!(attr_value(&attrs, "protocol_fees/token1"), BigInt::from(8));
+    }
+
+    #[test]
+    fn skips_protocol_fee_storage_changes_outside_event_pool_calls() {
+        let pool = pool_address(1);
+        let events = Events { pool_events: vec![swap_event(pool.clone(), 1)] };
+
+        let changes = collect_pool_protocol_fee_changes(
+            &block(
+                43_005_492,
+                vec![eth::TransactionTrace {
+                    index: 1,
+                    status: 1,
+                    hash: vec![1; 32],
+                    from: pool_bytes(7),
+                    to: pool_bytes(8),
+                    calls: vec![
+                        eth::Call {
+                            address: pool_bytes(9),
+                            storage_changes: vec![protocol_fee_storage_change(
+                                pool_bytes(1),
+                                10,
+                                1,
+                                2,
+                                3,
+                                4,
+                            )],
+                            ..Default::default()
+                        },
+                        eth::Call {
+                            address: pool_bytes(1),
+                            storage_changes: vec![protocol_fee_storage_change(
+                                pool_bytes(1),
+                                11,
+                                3,
+                                4,
+                                5,
+                                6,
+                            )],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+            ),
+            events,
+        );
+        let attrs = attributes_for_pool(&changes, &pool);
+
+        assert_eq!(attr_value(&attrs, "protocol_fees/token0"), BigInt::from(5));
+        assert_eq!(attr_value(&attrs, "protocol_fees/token1"), BigInt::from(6));
     }
 
     fn attributes_for_pool(
@@ -269,7 +324,14 @@ mod tests {
             hash: vec![index as u8; 32],
             from: pool_bytes(7),
             to: pool_bytes(8),
-            calls: vec![eth::Call { storage_changes, ..Default::default() }],
+            calls: vec![eth::Call {
+                address: storage_changes
+                    .first()
+                    .map(|change| change.address.clone())
+                    .unwrap_or_default(),
+                storage_changes,
+                ..Default::default()
+            }],
             ..Default::default()
         }
     }
