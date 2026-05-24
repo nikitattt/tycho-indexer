@@ -17,10 +17,7 @@ use substreams::{
     store::{StoreGet, StoreGetProto},
     Hex,
 };
-use substreams_ethereum::{
-    pb::eth::v2::{self as eth, Log, TransactionTrace},
-    Event,
-};
+use substreams_ethereum::pb::eth::v2::{self as eth, Log, TransactionTrace};
 
 #[substreams::handlers::map]
 pub fn map_events(
@@ -82,134 +79,175 @@ fn event_from_known_pool_log<F>(
 where
     F: FnMut(&[u8]) -> Option<Pool>,
 {
-    if !is_v3_pool_event_log(log) {
-        return None;
-    }
+    let event_kind = classify_v3_pool_event_log(log)?;
 
     let pool = pool_cache.get_or_lookup(&log.address, lookup_pool)?;
-    log_to_event(log, pool, tx)
+    log_to_event(log, event_kind, pool, tx)
 }
 
-fn is_v3_pool_event_log(log: &Log) -> bool {
-    Initialize::match_log(log)
-        || Swap::match_log(log)
-        || Mint::match_log(log)
-        || Burn::match_log(log)
-        || Collect::match_log(log)
-        || Flash::match_log(log)
-        || SetFeeProtocol::match_log(log)
-        || CollectProtocol::match_log(log)
+#[derive(Clone, Copy)]
+enum EventKind {
+    Initialize,
+    Swap,
+    Flash,
+    Mint,
+    Burn,
+    Collect,
+    SetFeeProtocol,
+    CollectProtocol,
 }
 
-fn log_to_event(event: &Log, pool: &Pool, tx: &TransactionTrace) -> Option<PoolEvent> {
-    if let Some(init) = Initialize::match_and_decode(event) {
-        Some(pool_event(
-            event,
-            pool,
-            tx,
-            Type::Initialize(pool_event::Initialize {
-                sqrt_price: init.sqrt_price_x96.to_string(),
-                tick: init.tick.into(),
-            }),
-        ))
-    } else if let Some(swap) = Swap::match_and_decode(event) {
-        Some(pool_event(
-            event,
-            pool,
-            tx,
-            Type::Swap(pool_event::Swap {
-                sender: Hex(swap.sender).to_string(),
-                recipient: Hex(swap.recipient).to_string(),
-                amount_0: swap.amount0.to_string(),
-                amount_1: swap.amount1.to_string(),
-                sqrt_price: swap.sqrt_price_x96.to_string(),
-                liquidity: swap.liquidity.to_string(),
-                tick: swap.tick.into(),
-            }),
-        ))
-    } else if let Some(flash) = Flash::match_and_decode(event) {
-        Some(pool_event(
-            event,
-            pool,
-            tx,
-            Type::Flash(pool_event::Flash {
-                sender: Hex(flash.sender).to_string(),
-                recipient: Hex(flash.recipient).to_string(),
-                amount_0: flash.amount0.to_string(),
-                amount_1: flash.amount1.to_string(),
-                paid_0: flash.paid0.to_string(),
-                paid_1: flash.paid1.to_string(),
-            }),
-        ))
-    } else if let Some(mint) = Mint::match_and_decode(event) {
-        Some(pool_event(
-            event,
-            pool,
-            tx,
-            Type::Mint(pool_event::Mint {
-                sender: Hex(mint.sender).to_string(),
-                owner: Hex(mint.owner).to_string(),
-                tick_lower: mint.tick_lower.into(),
-                tick_upper: mint.tick_upper.into(),
-                amount: mint.amount.to_string(),
-                amount_0: mint.amount0.to_string(),
-                amount_1: mint.amount1.to_string(),
-            }),
-        ))
-    } else if let Some(burn) = Burn::match_and_decode(event) {
-        Some(pool_event(
-            event,
-            pool,
-            tx,
-            Type::Burn(pool_event::Burn {
-                owner: Hex(burn.owner).to_string(),
-                tick_lower: burn.tick_lower.into(),
-                tick_upper: burn.tick_upper.into(),
-                amount: burn.amount.to_string(),
-                amount_0: burn.amount0.to_string(),
-                amount_1: burn.amount1.to_string(),
-            }),
-        ))
-    } else if let Some(collect) = Collect::match_and_decode(event) {
-        Some(pool_event(
-            event,
-            pool,
-            tx,
-            Type::Collect(pool_event::Collect {
-                owner: Hex(collect.owner).to_string(),
-                recipient: Hex(collect.recipient).to_string(),
-                tick_lower: collect.tick_lower.into(),
-                tick_upper: collect.tick_upper.into(),
-                amount_0: collect.amount0.to_string(),
-                amount_1: collect.amount1.to_string(),
-            }),
-        ))
-    } else if let Some(set_fp) = SetFeeProtocol::match_and_decode(event) {
-        Some(pool_event(
-            event,
-            pool,
-            tx,
-            Type::SetFeeProtocol(pool_event::SetFeeProtocol {
-                fee_protocol_0_old: set_fp.fee_protocol0_old.to_u64(),
-                fee_protocol_1_old: set_fp.fee_protocol1_old.to_u64(),
-                fee_protocol_0_new: set_fp.fee_protocol0_new.to_u64(),
-                fee_protocol_1_new: set_fp.fee_protocol1_new.to_u64(),
-            }),
-        ))
-    } else if let Some(cp) = CollectProtocol::match_and_decode(event) {
-        Some(pool_event(
-            event,
-            pool,
-            tx,
-            Type::CollectProtocol(pool_event::CollectProtocol {
-                sender: Hex(cp.sender).to_string(),
-                recipient: Hex(cp.recipient).to_string(),
-                amount_0: cp.amount0.to_string(),
-                amount_1: cp.amount1.to_string(),
-            }),
-        ))
+fn classify_v3_pool_event_log(log: &Log) -> Option<EventKind> {
+    if Initialize::match_log(log) {
+        Some(EventKind::Initialize)
+    } else if Swap::match_log(log) {
+        Some(EventKind::Swap)
+    } else if Flash::match_log(log) {
+        Some(EventKind::Flash)
+    } else if Mint::match_log(log) {
+        Some(EventKind::Mint)
+    } else if Burn::match_log(log) {
+        Some(EventKind::Burn)
+    } else if Collect::match_log(log) {
+        Some(EventKind::Collect)
+    } else if SetFeeProtocol::match_log(log) {
+        Some(EventKind::SetFeeProtocol)
+    } else if CollectProtocol::match_log(log) {
+        Some(EventKind::CollectProtocol)
     } else {
         None
+    }
+}
+
+fn log_to_event(
+    event: &Log,
+    event_kind: EventKind,
+    pool: &Pool,
+    tx: &TransactionTrace,
+) -> Option<PoolEvent> {
+    match event_kind {
+        EventKind::Initialize => {
+            let init = Initialize::decode(event).ok()?;
+            Some(pool_event(
+                event,
+                pool,
+                tx,
+                Type::Initialize(pool_event::Initialize {
+                    sqrt_price: init.sqrt_price_x96.to_string(),
+                    tick: init.tick.into(),
+                }),
+            ))
+        }
+        EventKind::Swap => {
+            let swap = Swap::decode(event).ok()?;
+            Some(pool_event(
+                event,
+                pool,
+                tx,
+                Type::Swap(pool_event::Swap {
+                    sender: Hex(swap.sender).to_string(),
+                    recipient: Hex(swap.recipient).to_string(),
+                    amount_0: swap.amount0.to_string(),
+                    amount_1: swap.amount1.to_string(),
+                    sqrt_price: swap.sqrt_price_x96.to_string(),
+                    liquidity: swap.liquidity.to_string(),
+                    tick: swap.tick.into(),
+                }),
+            ))
+        }
+        EventKind::Flash => {
+            let flash = Flash::decode(event).ok()?;
+            Some(pool_event(
+                event,
+                pool,
+                tx,
+                Type::Flash(pool_event::Flash {
+                    sender: Hex(flash.sender).to_string(),
+                    recipient: Hex(flash.recipient).to_string(),
+                    amount_0: flash.amount0.to_string(),
+                    amount_1: flash.amount1.to_string(),
+                    paid_0: flash.paid0.to_string(),
+                    paid_1: flash.paid1.to_string(),
+                }),
+            ))
+        }
+        EventKind::Mint => {
+            let mint = Mint::decode(event).ok()?;
+            Some(pool_event(
+                event,
+                pool,
+                tx,
+                Type::Mint(pool_event::Mint {
+                    sender: Hex(mint.sender).to_string(),
+                    owner: Hex(mint.owner).to_string(),
+                    tick_lower: mint.tick_lower.into(),
+                    tick_upper: mint.tick_upper.into(),
+                    amount: mint.amount.to_string(),
+                    amount_0: mint.amount0.to_string(),
+                    amount_1: mint.amount1.to_string(),
+                }),
+            ))
+        }
+        EventKind::Burn => {
+            let burn = Burn::decode(event).ok()?;
+            Some(pool_event(
+                event,
+                pool,
+                tx,
+                Type::Burn(pool_event::Burn {
+                    owner: Hex(burn.owner).to_string(),
+                    tick_lower: burn.tick_lower.into(),
+                    tick_upper: burn.tick_upper.into(),
+                    amount: burn.amount.to_string(),
+                    amount_0: burn.amount0.to_string(),
+                    amount_1: burn.amount1.to_string(),
+                }),
+            ))
+        }
+        EventKind::Collect => {
+            let collect = Collect::decode(event).ok()?;
+            Some(pool_event(
+                event,
+                pool,
+                tx,
+                Type::Collect(pool_event::Collect {
+                    owner: Hex(collect.owner).to_string(),
+                    recipient: Hex(collect.recipient).to_string(),
+                    tick_lower: collect.tick_lower.into(),
+                    tick_upper: collect.tick_upper.into(),
+                    amount_0: collect.amount0.to_string(),
+                    amount_1: collect.amount1.to_string(),
+                }),
+            ))
+        }
+        EventKind::SetFeeProtocol => {
+            let set_fp = SetFeeProtocol::decode(event).ok()?;
+            Some(pool_event(
+                event,
+                pool,
+                tx,
+                Type::SetFeeProtocol(pool_event::SetFeeProtocol {
+                    fee_protocol_0_old: set_fp.fee_protocol0_old.to_u64(),
+                    fee_protocol_1_old: set_fp.fee_protocol1_old.to_u64(),
+                    fee_protocol_0_new: set_fp.fee_protocol0_new.to_u64(),
+                    fee_protocol_1_new: set_fp.fee_protocol1_new.to_u64(),
+                }),
+            ))
+        }
+        EventKind::CollectProtocol => {
+            let cp = CollectProtocol::decode(event).ok()?;
+            Some(pool_event(
+                event,
+                pool,
+                tx,
+                Type::CollectProtocol(pool_event::CollectProtocol {
+                    sender: Hex(cp.sender).to_string(),
+                    recipient: Hex(cp.recipient).to_string(),
+                    amount_0: cp.amount0.to_string(),
+                    amount_1: cp.amount1.to_string(),
+                }),
+            ))
+        }
     }
 }
 
@@ -293,7 +331,7 @@ mod tests {
 
     #[test]
     fn recognizes_only_supported_v3_pool_event_shapes() {
-        assert!(is_v3_pool_event_log(&swap_log(pool_address(1), 1)));
+        assert!(classify_v3_pool_event_log(&swap_log(pool_address(1), 1)).is_some());
 
         let malformed_swap = Log {
             address: pool_address(1),
@@ -302,7 +340,7 @@ mod tests {
             ordinal: 1,
             ..Default::default()
         };
-        assert!(!is_v3_pool_event_log(&malformed_swap));
+        assert!(classify_v3_pool_event_log(&malformed_swap).is_none());
     }
 
     fn swap_log(address: Vec<u8>, ordinal: u64) -> Log {

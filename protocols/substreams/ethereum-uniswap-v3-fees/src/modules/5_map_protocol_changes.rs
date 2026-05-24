@@ -10,7 +10,8 @@ use tycho_substreams::{balances::aggregate_balances_changes, prelude::*};
 pub fn map_protocol_changes(
     block: eth::Block,
     created_pools: BlockEntityChanges,
-    pool_attribute_changes: BlockEntityChanges,
+    pool_event_attribute_changes: BlockEntityChanges,
+    pool_protocol_fee_changes: BlockEntityChanges,
     balances_map_deltas: BlockBalanceDeltas,
     balances_store_deltas: StoreDeltas,
     ticks_map_deltas: TickDeltas,
@@ -48,24 +49,8 @@ pub fn map_protocol_changes(
             });
     }
 
-    // Pool attributes are emitted by a dedicated module that owns all direct pool-attribute
-    // extraction from logs and storage. Keeping that work out of this final merger makes this
-    // module mostly a deterministic assembler.
-    for change in pool_attribute_changes
-        .changes
-        .into_iter()
-    {
-        let tx = change.tx.as_ref().unwrap();
-        let builder = transaction_changes
-            .entry(tx.index)
-            .or_insert_with(|| TransactionChangesBuilder::new(tx));
-        change
-            .entity_changes
-            .iter()
-            .for_each(|ec| {
-                builder.add_entity_change(ec);
-            });
-    }
+    add_pool_attribute_changes(pool_event_attribute_changes, &mut transaction_changes);
+    add_pool_attribute_changes(pool_protocol_fee_changes, &mut transaction_changes);
 
     // Balance changes are gathered by the `StoreDelta` based on `PoolBalanceChanged` creating
     //  `BlockBalanceDeltas`. We essentially just process the changes that occurred to the `store`
@@ -161,4 +146,22 @@ pub fn map_protocol_changes(
             .collect::<Vec<_>>(),
         ..Default::default()
     })
+}
+
+fn add_pool_attribute_changes(
+    pool_attribute_changes: BlockEntityChanges,
+    transaction_changes: &mut HashMap<u64, TransactionChangesBuilder>,
+) {
+    for change in pool_attribute_changes.changes {
+        let tx = change.tx.as_ref().unwrap();
+        let builder = transaction_changes
+            .entry(tx.index)
+            .or_insert_with(|| TransactionChangesBuilder::new(tx));
+        change
+            .entity_changes
+            .iter()
+            .for_each(|ec| {
+                builder.add_entity_change(ec);
+            });
+    }
 }

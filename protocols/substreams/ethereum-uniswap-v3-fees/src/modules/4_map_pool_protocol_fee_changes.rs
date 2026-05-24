@@ -1,40 +1,29 @@
 use crate::{
     modules::pool_key,
-    pb::uniswap::v3::{
-        events::{pool_event, PoolEvent},
-        Events, Pool,
-    },
+    pb::uniswap::v3::{Events, Pool},
     storage::{protocol_fee_attributes, PROTOCOL_FEES_SLOT},
 };
 use itertools::Itertools;
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
-use substreams::{
-    scalar::BigInt,
-    store::{StoreGet, StoreGetProto},
-};
+use std::collections::{HashMap, HashSet};
+use substreams::store::{StoreGet, StoreGetProto};
 use substreams_ethereum::pb::eth::v2 as eth;
 use substreams_helper::hex::Hexable;
 use tycho_substreams::prelude::*;
 
-type PoolAddress = Vec<u8>;
-
 const BASE_PROTOCOL_FEES_INITIAL_BLOCK: u64 = 43_005_492;
 
 #[substreams::handlers::map]
-pub fn map_pool_attribute_changes(
+pub fn map_pool_protocol_fee_changes(
     block: eth::Block,
     events: Events,
     pools_store: StoreGetProto<Pool>,
 ) -> Result<BlockEntityChanges, substreams::errors::Error> {
-    Ok(collect_pool_attribute_changes(&block, events, |address| {
+    Ok(collect_pool_protocol_fee_changes(&block, events, |address| {
         pools_store.get_last(pool_key(address))
     }))
 }
 
-fn collect_pool_attribute_changes<F>(
+fn collect_pool_protocol_fee_changes<F>(
     block: &eth::Block,
     events: Events,
     mut lookup_pool: F,
@@ -42,16 +31,15 @@ fn collect_pool_attribute_changes<F>(
 where
     F: FnMut(&[u8]) -> Option<Pool>,
 {
-    let event_known_pools = events
-        .pool_events
-        .iter()
-        .filter_map(|event| hex::decode(&event.pool_address).ok())
-        .collect::<HashSet<_>>();
     let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
 
-    add_event_attribute_changes(events, &mut transaction_changes);
-
     if block.number >= BASE_PROTOCOL_FEES_INITIAL_BLOCK {
+        let event_known_pools = events
+            .pool_events
+            .iter()
+            .filter_map(|event| hex::decode(&event.pool_address).ok())
+            .collect::<HashSet<_>>();
+
         add_protocol_fee_changes(
             block,
             &event_known_pools,
@@ -74,19 +62,6 @@ where
             })
             .collect(),
     }
-}
-
-fn add_event_attribute_changes(
-    events: Events,
-    transaction_changes: &mut HashMap<u64, TransactionChangesBuilder>,
-) {
-    events
-        .pool_events
-        .into_iter()
-        .flat_map(event_to_attribute_updates)
-        .for_each(|(tx, pool_address, attr)| {
-            add_pool_attribute(transaction_changes, &tx, &pool_address, attr);
-        });
 }
 
 fn add_protocol_fee_changes<F>(
@@ -203,90 +178,6 @@ struct PendingAttribute {
     order: (u64, u64),
 }
 
-fn event_to_attribute_updates(event: PoolEvent) -> Vec<(Transaction, PoolAddress, Attribute)> {
-    match event.r#type.as_ref().unwrap() {
-        pool_event::Type::Initialize(initialize) => {
-            vec![
-                (
-                    event
-                        .transaction
-                        .as_ref()
-                        .unwrap()
-                        .into(),
-                    hex::decode(&event.pool_address).unwrap(),
-                    Attribute {
-                        name: "sqrt_price_x96".to_string(),
-                        value: BigInt::from_str(&initialize.sqrt_price)
-                            .unwrap()
-                            .to_signed_bytes_be(),
-                        change: ChangeType::Update.into(),
-                    },
-                ),
-                (
-                    event.transaction.unwrap().into(),
-                    hex::decode(event.pool_address).unwrap(),
-                    Attribute {
-                        name: "tick".to_string(),
-                        value: BigInt::from(initialize.tick).to_signed_bytes_be(),
-                        change: ChangeType::Update.into(),
-                    },
-                ),
-            ]
-        }
-        pool_event::Type::Swap(swap) => vec![
-            (
-                event
-                    .transaction
-                    .as_ref()
-                    .unwrap()
-                    .into(),
-                hex::decode(&event.pool_address).unwrap(),
-                Attribute {
-                    name: "sqrt_price_x96".to_string(),
-                    value: BigInt::from_str(&swap.sqrt_price)
-                        .unwrap()
-                        .to_signed_bytes_be(),
-                    change: ChangeType::Update.into(),
-                },
-            ),
-            (
-                event.transaction.unwrap().into(),
-                hex::decode(event.pool_address).unwrap(),
-                Attribute {
-                    name: "tick".to_string(),
-                    value: BigInt::from(swap.tick).to_signed_bytes_be(),
-                    change: ChangeType::Update.into(),
-                },
-            ),
-        ],
-        pool_event::Type::SetFeeProtocol(sfp) => vec![
-            (
-                event
-                    .transaction
-                    .as_ref()
-                    .unwrap()
-                    .into(),
-                hex::decode(&event.pool_address).unwrap(),
-                Attribute {
-                    name: "fee_protocol/token0".to_string(),
-                    value: BigInt::from(sfp.fee_protocol_0_new).to_signed_bytes_be(),
-                    change: ChangeType::Update.into(),
-                },
-            ),
-            (
-                event.transaction.unwrap().into(),
-                hex::decode(event.pool_address).unwrap(),
-                Attribute {
-                    name: "fee_protocol/token1".to_string(),
-                    value: BigInt::from(sfp.fee_protocol_1_new).to_signed_bytes_be(),
-                    change: ChangeType::Update.into(),
-                },
-            ),
-        ],
-        _ => vec![],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,42 +187,21 @@ mod tests {
                 pool_event::{self, Type},
                 PoolEvent,
             },
-            Events, Pool, Transaction,
+            Transaction,
         },
         storage::PROTOCOL_FEES_SLOT,
     };
     use substreams::scalar::BigInt;
     use substreams_ethereum::pb::eth::v2 as eth;
-    use tycho_substreams::prelude::ChangeType;
-
-    #[test]
-    fn emits_event_driven_pool_attributes() {
-        let pool = pool_address(1);
-        let events = Events {
-            pool_events: vec![
-                initialize_event(pool.clone(), 10, 123, -7),
-                swap_event(pool.clone(), 11, 456, 8),
-                set_fee_protocol_event(pool.clone(), 12, 3, 4),
-            ],
-        };
-
-        let changes = collect_pool_attribute_changes(&block(43_005_491, vec![]), events, |_| None);
-        let attrs = attributes_for_pool(&changes, &pool);
-
-        assert_eq!(attr_value(&attrs, "sqrt_price_x96"), BigInt::from(456));
-        assert_eq!(attr_value(&attrs, "tick"), BigInt::from(8));
-        assert_eq!(attr_value(&attrs, "fee_protocol/token0"), BigInt::from(3));
-        assert_eq!(attr_value(&attrs, "fee_protocol/token1"), BigInt::from(4));
-    }
 
     #[test]
     fn emits_protocol_fee_storage_attributes_for_event_known_pool_without_store_lookup() {
         let pool = pool_address(1);
         let storage_change = protocol_fee_storage_change(pool_bytes(1), 10, 1, 2, 3, 4);
-        let events = Events { pool_events: vec![swap_event(pool.clone(), 9, 0, 0)] };
+        let events = Events { pool_events: vec![swap_event(pool.clone(), 9)] };
         let mut lookups = 0;
 
-        let changes = collect_pool_attribute_changes(
+        let changes = collect_pool_protocol_fee_changes(
             &block(43_005_492, vec![tx_trace(1, vec![storage_change])]),
             events,
             |_| {
@@ -353,7 +223,7 @@ mod tests {
         let events = Events { pool_events: vec![] };
         let mut lookups = 0;
 
-        let changes = collect_pool_attribute_changes(
+        let changes = collect_pool_protocol_fee_changes(
             &block(43_005_492, vec![tx_trace(1, vec![storage_change.clone(), storage_change])]),
             events,
             |_| {
@@ -383,10 +253,8 @@ mod tests {
     fn attr_value(attrs: &[tycho_substreams::prelude::Attribute], name: &str) -> BigInt {
         let attr = attrs
             .iter()
-            .filter(|attr| attr.name == name)
-            .last()
+            .find(|attr| attr.name == name)
             .unwrap_or_else(|| panic!("missing attribute {name}"));
-        assert_eq!(attr.change, i32::from(ChangeType::Update));
         BigInt::from_signed_bytes_be(&attr.value)
     }
 
@@ -429,56 +297,19 @@ mod tests {
         value
     }
 
-    fn initialize_event(
-        pool_address: String,
-        ordinal: u64,
-        sqrt_price: u64,
-        tick: i32,
-    ) -> PoolEvent {
-        PoolEvent {
-            pool_address,
-            log_ordinal: ordinal,
-            transaction: Some(tx(ordinal)),
-            r#type: Some(Type::Initialize(pool_event::Initialize {
-                sqrt_price: sqrt_price.to_string(),
-                tick,
-            })),
-            ..Default::default()
-        }
-    }
-
-    fn swap_event(pool_address: String, ordinal: u64, sqrt_price: u64, tick: i32) -> PoolEvent {
+    fn swap_event(pool_address: String, ordinal: u64) -> PoolEvent {
         PoolEvent {
             pool_address,
             log_ordinal: ordinal,
             transaction: Some(tx(ordinal)),
             r#type: Some(Type::Swap(pool_event::Swap {
-                sqrt_price: sqrt_price.to_string(),
-                tick,
+                sqrt_price: "0".to_string(),
+                tick: 0,
                 liquidity: "0".to_string(),
                 amount_0: "0".to_string(),
                 amount_1: "0".to_string(),
                 sender: String::new(),
                 recipient: String::new(),
-            })),
-            ..Default::default()
-        }
-    }
-
-    fn set_fee_protocol_event(
-        pool_address: String,
-        ordinal: u64,
-        token0_fee: u64,
-        token1_fee: u64,
-    ) -> PoolEvent {
-        PoolEvent {
-            pool_address,
-            log_ordinal: ordinal,
-            transaction: Some(tx(ordinal)),
-            r#type: Some(Type::SetFeeProtocol(pool_event::SetFeeProtocol {
-                fee_protocol_0_new: token0_fee,
-                fee_protocol_1_new: token1_fee,
-                ..Default::default()
             })),
             ..Default::default()
         }

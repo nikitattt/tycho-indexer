@@ -56,7 +56,15 @@ modules:
       output:
           type: proto:tycho.evm.v1.BlockBalanceDeltas
 
-    - name: map_pool_attribute_changes
+    - name: map_pool_event_attribute_changes
+      kind: map
+      initialBlock: 44100000
+      inputs:
+          - map: map_events
+      output:
+          type: proto:tycho.evm.v1.BlockEntityChanges
+
+    - name: map_pool_protocol_fee_changes
       kind: map
       initialBlock: 44100000
       inputs:
@@ -121,7 +129,8 @@ modules:
       inputs:
           - source: sf.ethereum.type.v2.Block
           - map: map_pools_created
-          - map: map_pool_attribute_changes
+          - map: map_pool_event_attribute_changes
+          - map: map_pool_protocol_fee_changes
           - map: map_balance_changes
           - store: store_pools_balances
             mode: deltas
