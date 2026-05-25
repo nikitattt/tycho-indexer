@@ -1,7 +1,7 @@
 specVersion: v0.1.0
 package:
     name: "base_uniswap_v3_latency_probe"
-    version: v0.1.0
+    version: v0.2.0
 
 protobuf:
     files:
@@ -22,11 +22,19 @@ binaries:
         file: ../target/wasm32-unknown-unknown/release/base_uniswap_v3_latency_probe.wasm
 
 modules:
-    - name: map_events
+    - name: map_pool_data
       kind: map
       initialBlock: 46344200
       inputs:
           - source: sf.ethereum.type.v2.Block
+      output:
+          type: proto:uniswap.v3.BlockPoolData
+
+    - name: map_events
+      kind: map
+      initialBlock: 46344200
+      inputs:
+          - map: map_pool_data
       output:
           type: proto:uniswap.v3.Events
 
@@ -37,6 +45,22 @@ modules:
           - map: map_events
       output:
           type: proto:tycho.evm.v1.BlockBalanceDeltas
+
+    - name: map_pool_event_attribute_changes
+      kind: map
+      initialBlock: 46344200
+      inputs:
+          - map: map_events
+      output:
+          type: proto:tycho.evm.v1.BlockEntityChanges
+
+    - name: map_pool_protocol_fee_changes
+      kind: map
+      initialBlock: 46344200
+      inputs:
+          - map: map_pool_data
+      output:
+          type: proto:tycho.evm.v1.BlockEntityChanges
 
     - name: store_pools_balances
       kind: store
@@ -91,8 +115,9 @@ modules:
       kind: map
       initialBlock: 46344200
       inputs:
-          - source: sf.ethereum.type.v2.Block
-          - map: map_events
+          - map: map_pool_data
+          - map: map_pool_event_attribute_changes
+          - map: map_pool_protocol_fee_changes
           - map: map_balance_changes
           - store: store_pools_balances
             mode: deltas

@@ -1,9 +1,22 @@
 use hex_literal::hex;
 
+use crate::pb::uniswap::v3::Pool;
+
 pub struct FixedPool {
     pub address: [u8; 20],
     pub token0: [u8; 20],
     pub token1: [u8; 20],
+}
+
+impl FixedPool {
+    pub fn to_pool(&self) -> Pool {
+        Pool {
+            address: self.address.to_vec(),
+            token0: self.token0.to_vec(),
+            token1: self.token1.to_vec(),
+            created_tx_hash: Vec::new(),
+        }
+    }
 }
 
 pub const FIXED_POOLS: [FixedPool; 10] = [
@@ -63,8 +76,4 @@ pub fn fixed_pool(address: &[u8]) -> Option<&'static FixedPool> {
     FIXED_POOLS
         .iter()
         .find(|pool| pool.address.as_slice() == address)
-}
-
-pub fn is_fixed_pool(address: &[u8]) -> bool {
-    fixed_pool(address).is_some()
 }
