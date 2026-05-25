@@ -12,9 +12,27 @@ use crate::{
     },
 };
 use anyhow::Ok;
+use hex_literal::hex;
 use std::collections::{hash_map::Entry, HashMap};
 use substreams::store::{StoreGet, StoreGetProto};
 use substreams_ethereum::pb::eth::v2::{self as eth, Log, TransactionTrace};
+
+const BURN_TOPIC: [u8; 32] =
+    hex!("0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c");
+const COLLECT_TOPIC: [u8; 32] =
+    hex!("70935338e69775456a85ddef226c395fb668b63fa0115f5f20610b388e6ca9c0");
+const COLLECT_PROTOCOL_TOPIC: [u8; 32] =
+    hex!("596b573906218d3411850b26a6b437d6c4522fdb43d2d2386263f86d50b8b151");
+const FLASH_TOPIC: [u8; 32] =
+    hex!("bddbd71d7860376ba52b25a5028beea23581364a40522f6bcfb86bb1f2dca633");
+const INITIALIZE_TOPIC: [u8; 32] =
+    hex!("98636036cb66a9c19a37435efc1e90142190214e8abeb821bdba3f2990dd4c95");
+const MINT_TOPIC: [u8; 32] =
+    hex!("7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde");
+const SET_FEE_PROTOCOL_TOPIC: [u8; 32] =
+    hex!("973d8d92bb299f4af6ce49b52a8adb85ae46b9f214c4c4fc06ac77401237b133");
+const SWAP_TOPIC: [u8; 32] =
+    hex!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
 #[substreams::handlers::map]
 pub fn map_events(
@@ -95,22 +113,47 @@ enum EventKind {
 }
 
 fn classify_v3_pool_event_log(log: &Log) -> Option<EventKind> {
-    if Initialize::match_log(log) {
-        Some(EventKind::Initialize)
-    } else if Swap::match_log(log) {
-        Some(EventKind::Swap)
-    } else if Flash::match_log(log) {
-        Some(EventKind::Flash)
-    } else if Mint::match_log(log) {
-        Some(EventKind::Mint)
-    } else if Burn::match_log(log) {
-        Some(EventKind::Burn)
-    } else if Collect::match_log(log) {
-        Some(EventKind::Collect)
-    } else if SetFeeProtocol::match_log(log) {
-        Some(EventKind::SetFeeProtocol)
-    } else if CollectProtocol::match_log(log) {
-        Some(EventKind::CollectProtocol)
+    let topic0 = log.topics.first()?;
+    let selector = topic_selector(topic0)?;
+
+    match selector {
+        0x0c396cd9 => shaped_event(log, topic0, &BURN_TOPIC, 4, 96, EventKind::Burn),
+        0x596b5739 => {
+            shaped_event(log, topic0, &COLLECT_PROTOCOL_TOPIC, 3, 64, EventKind::CollectProtocol)
+        }
+        0x70935338 => shaped_event(log, topic0, &COLLECT_TOPIC, 4, 96, EventKind::Collect),
+        0x7a53080b => shaped_event(log, topic0, &MINT_TOPIC, 4, 128, EventKind::Mint),
+        0x973d8d92 => {
+            shaped_event(log, topic0, &SET_FEE_PROTOCOL_TOPIC, 1, 128, EventKind::SetFeeProtocol)
+        }
+        0x98636036 => shaped_event(log, topic0, &INITIALIZE_TOPIC, 1, 64, EventKind::Initialize),
+        0xbddbd71d => shaped_event(log, topic0, &FLASH_TOPIC, 3, 128, EventKind::Flash),
+        0xc42079f9 => shaped_event(log, topic0, &SWAP_TOPIC, 3, 160, EventKind::Swap),
+        _ => None,
+    }
+}
+
+fn topic_selector(topic: &[u8]) -> Option<u32> {
+    if topic.len() != 32 {
+        return None;
+    }
+
+    Some(u32::from_be_bytes(topic[0..4].try_into().ok()?))
+}
+
+fn shaped_event(
+    log: &Log,
+    topic0: &[u8],
+    expected_topic0: &[u8; 32],
+    topics_len: usize,
+    data_len: usize,
+    event_kind: EventKind,
+) -> Option<EventKind> {
+    if topic0 == expected_topic0.as_slice()
+        && log.topics.len() == topics_len
+        && log.data.len() == data_len
+    {
+        Some(event_kind)
     } else {
         None
     }
@@ -262,11 +305,8 @@ fn pool_event(event: &Log, pool: &Pool, tx: &TransactionTrace, r#type: Type) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hex_literal::hex;
     use substreams::scalar::BigInt;
 
-    const SWAP_TOPIC: [u8; 32] =
-        hex!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
     const TRANSFER_TOPIC: [u8; 32] =
         hex!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
 
@@ -339,6 +379,17 @@ mod tests {
             ..Default::default()
         };
         assert!(classify_v3_pool_event_log(&malformed_swap).is_none());
+
+        let mut wrong_full_topic = SWAP_TOPIC;
+        wrong_full_topic[31] ^= 1;
+        let wrong_full_topic_swap = Log {
+            address: pool_address(1),
+            topics: vec![wrong_full_topic.to_vec(), address_topic(2), address_topic(3)],
+            data: vec![0; 160],
+            ordinal: 1,
+            ..Default::default()
+        };
+        assert!(classify_v3_pool_event_log(&wrong_full_topic_swap).is_none());
     }
 
     #[test]

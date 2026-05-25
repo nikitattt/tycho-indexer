@@ -1,5 +1,8 @@
 use crate::{
-    pb::uniswap::v3::Events,
+    pb::uniswap::v3::{
+        events::{pool_event, PoolEvent},
+        Events,
+    },
     storage::{protocol_fee_attributes, PROTOCOL_FEES_SLOT},
 };
 use itertools::Itertools;
@@ -50,6 +53,10 @@ fn event_pools_by_tx(events: &Events) -> HashMap<u64, HashSet<Vec<u8>>> {
             continue;
         };
 
+        if !can_change_protocol_fees(event) {
+            continue;
+        }
+
         pools_by_tx
             .entry(tx.index)
             .or_insert_with(HashSet::new)
@@ -57,6 +64,15 @@ fn event_pools_by_tx(events: &Events) -> HashMap<u64, HashSet<Vec<u8>>> {
     }
 
     pools_by_tx
+}
+
+fn can_change_protocol_fees(event: &PoolEvent) -> bool {
+    matches!(
+        event.r#type.as_ref(),
+        Some(pool_event::Type::Swap(_))
+            | Some(pool_event::Type::Flash(_))
+            | Some(pool_event::Type::CollectProtocol(_))
+    )
 }
 
 fn add_protocol_fee_changes(
@@ -284,6 +300,20 @@ mod tests {
         assert_eq!(attr_value(&attrs, "protocol_fees/token1"), BigInt::from(6));
     }
 
+    #[test]
+    fn ignores_protocol_fee_storage_for_non_fee_affecting_pool_events() {
+        let pool = pool_bytes(1);
+        let storage_change = protocol_fee_storage_change(pool_bytes(1), 10, 1, 2, 3, 4);
+        let events = Events { pool_events: vec![mint_event(pool, 1)] };
+
+        let changes = collect_pool_protocol_fee_changes(
+            &block(43_005_492, vec![tx_trace(1, vec![storage_change])]),
+            events,
+        );
+
+        assert!(changes.changes.is_empty());
+    }
+
     fn attributes_for_pool(
         changes: &tycho_substreams::prelude::BlockEntityChanges,
         pool: &[u8],
@@ -365,6 +395,24 @@ mod tests {
                 amount_1: amount(0),
                 sender: Vec::new(),
                 recipient: Vec::new(),
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn mint_event(pool_address: Vec<u8>, ordinal: u64) -> PoolEvent {
+        PoolEvent {
+            pool_address,
+            log_ordinal: ordinal,
+            transaction: Some(tx(ordinal)),
+            r#type: Some(Type::Mint(pool_event::Mint {
+                sender: Vec::new(),
+                owner: Vec::new(),
+                tick_lower: -1,
+                tick_upper: 1,
+                amount: amount(1),
+                amount_0: amount(0),
+                amount_1: amount(0),
             })),
             ..Default::default()
         }
