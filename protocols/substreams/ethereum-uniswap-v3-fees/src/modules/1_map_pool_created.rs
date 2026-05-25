@@ -1,10 +1,17 @@
+use hex_literal::hex;
 use substreams::scalar::BigInt;
 use substreams_ethereum::pb::eth::v2::{self as eth};
 use substreams_helper::hex::Hexable;
+use tiny_keccak::{Hasher, Keccak};
 
 use crate::abi::factory::events::PoolCreated;
 
 use tycho_substreams::prelude::*;
+
+const BLOOM_BYTES: usize = 256;
+const BLOOM_BITS: usize = 2048;
+const POOL_CREATED_TOPIC: [u8; 32] =
+    hex!("783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118");
 
 #[substreams::handlers::map]
 pub fn map_pools_created(
@@ -16,7 +23,7 @@ pub fn map_pools_created(
     Ok(BlockEntityChanges { block: None, changes: get_new_pools(&block, &factory_address) })
 }
 
-fn decode_factory_address(factory_address: &str) -> Result<Vec<u8>, substreams::errors::Error> {
+fn decode_factory_address(factory_address: &str) -> Result<[u8; 20], substreams::errors::Error> {
     let address = hex::decode(factory_address.trim_start_matches("0x"))
         .map_err(|err| anyhow::anyhow!("invalid factory address `{factory_address}`: {err}"))?;
 
@@ -27,10 +34,16 @@ fn decode_factory_address(factory_address: &str) -> Result<Vec<u8>, substreams::
         ));
     }
 
-    Ok(address)
+    let mut decoded = [0u8; 20];
+    decoded.copy_from_slice(&address);
+    Ok(decoded)
 }
 
-fn get_new_pools(block: &eth::Block, factory_address: &[u8]) -> Vec<TransactionEntityChanges> {
+fn get_new_pools(block: &eth::Block, factory_address: &[u8; 20]) -> Vec<TransactionEntityChanges> {
+    if !block_bloom_may_contain_address(block, factory_address) {
+        return Vec::new();
+    }
+
     let mut new_pools = Vec::new();
 
     for tx in block
@@ -43,17 +56,79 @@ fn get_new_pools(block: &eth::Block, factory_address: &[u8]) -> Vec<TransactionE
         };
 
         for log in &receipt.logs {
-            if log.address.as_slice() != factory_address || !PoolCreated::match_log(log) {
+            if log.address.as_slice() != factory_address || !is_pool_created_log(log) {
                 continue;
             }
 
-            if let Ok(event) = PoolCreated::decode(log) {
+            if let Some(event) = decode_pool_created(log) {
                 new_pools.push(pool_created_changes(event, tx));
             }
         }
     }
 
     new_pools
+}
+
+fn block_bloom_may_contain_address(block: &eth::Block, address: &[u8; 20]) -> bool {
+    let Some(header) = block.header.as_ref() else {
+        return true;
+    };
+
+    if header.logs_bloom.len() != BLOOM_BYTES {
+        return true;
+    }
+
+    bloom_contains(&header.logs_bloom, address)
+}
+
+fn bloom_contains(bloom: &[u8], value: &[u8]) -> bool {
+    let bit_indexes = bloom_bit_indexes(value);
+
+    bit_indexes
+        .iter()
+        .all(|bit| bloom[BLOOM_BYTES - 1 - (bit / 8)] & (1 << (bit % 8)) != 0)
+}
+
+fn bloom_bit_indexes(value: &[u8]) -> [usize; 3] {
+    let mut hash = [0u8; 32];
+    let mut hasher = Keccak::v256();
+    hasher.update(value);
+    hasher.finalize(&mut hash);
+
+    [
+        (((hash[0] as usize) << 8) | hash[1] as usize) & (BLOOM_BITS - 1),
+        (((hash[2] as usize) << 8) | hash[3] as usize) & (BLOOM_BITS - 1),
+        (((hash[4] as usize) << 8) | hash[5] as usize) & (BLOOM_BITS - 1),
+    ]
+}
+
+fn is_pool_created_log(log: &eth::Log) -> bool {
+    log.topics.len() == 4
+        && log.data.len() == 64
+        && log.topics[0].as_slice() == POOL_CREATED_TOPIC.as_slice()
+}
+
+fn decode_pool_created(log: &eth::Log) -> Option<PoolCreated> {
+    let fee = log.topics[3].as_slice();
+    if fee.len() != 32 {
+        return None;
+    }
+
+    Some(PoolCreated {
+        token0: address_from_topic(&log.topics[1])?,
+        token1: address_from_topic(&log.topics[2])?,
+        fee: BigInt::from_unsigned_bytes_be(fee),
+        tick_spacing: BigInt::from_signed_bytes_be(log.data.get(0..32)?),
+        pool: address_from_topic(log.data.get(32..64)?)?,
+    })
+}
+
+fn address_from_topic(topic: &[u8]) -> Option<Vec<u8>> {
+    if topic.len() != 32 {
+        return None;
+    }
+
+    Some(topic[12..32].to_vec())
 }
 
 fn pool_created_changes(
@@ -144,14 +219,14 @@ mod tests {
 
     #[test]
     fn emits_factory_pool_created_logs() {
-        let factory = address(1);
+        let factory = address_array(1);
         let token0 = address(2);
         let token1 = address(3);
         let pool = address(4);
 
         let changes = get_new_pools(
             &block(vec![pool_created_log(
-                factory.clone(),
+                factory.to_vec(),
                 token0.clone(),
                 token1.clone(),
                 3000,
@@ -171,7 +246,7 @@ mod tests {
 
     #[test]
     fn ignores_pool_created_shaped_logs_from_non_factory_addresses() {
-        let factory = address(1);
+        let factory = address_array(1);
         let other_address = address(9);
 
         let changes = get_new_pools(
@@ -187,6 +262,58 @@ mod tests {
         );
 
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn skips_pool_scan_when_factory_is_absent_from_block_bloom() {
+        let factory = address_array(1);
+        let token0 = address(2);
+        let token1 = address(3);
+        let pool = address(4);
+        let block = block_with_bloom(
+            vec![pool_created_log(factory.to_vec(), token0, token1, 3000, 60, pool)],
+            vec![0; BLOOM_BYTES],
+        );
+
+        let changes = get_new_pools(&block, &factory);
+
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn scans_pool_created_logs_when_factory_is_present_in_block_bloom() {
+        let factory = address_array(1);
+        let token0 = address(2);
+        let token1 = address(3);
+        let pool = address(4);
+        let block = block_with_bloom(
+            vec![pool_created_log(
+                factory.to_vec(),
+                token0.clone(),
+                token1.clone(),
+                3000,
+                60,
+                pool.clone(),
+            )],
+            bloom_for(&factory),
+        );
+
+        let changes = get_new_pools(&block, &factory);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].component_changes[0].id, pool.to_hex());
+        assert_eq!(changes[0].component_changes[0].tokens, vec![token0, token1]);
+    }
+
+    #[test]
+    fn manually_decodes_signed_tick_spacing() {
+        let factory = address_array(1);
+        let log = pool_created_log(factory.to_vec(), address(2), address(3), 500, -10, address(4));
+
+        let event = decode_pool_created(&log).unwrap();
+
+        assert_eq!(event.fee, BigInt::from(500));
+        assert_eq!(event.tick_spacing, BigInt::from(-10));
     }
 
     fn static_attr(component: &ProtocolComponent, name: &str) -> BigInt {
@@ -213,12 +340,19 @@ mod tests {
         }
     }
 
+    fn block_with_bloom(logs: Vec<eth::Log>, logs_bloom: Vec<u8>) -> eth::Block {
+        eth::Block {
+            header: Some(eth::BlockHeader { logs_bloom, ..Default::default() }),
+            ..block(logs)
+        }
+    }
+
     fn pool_created_log(
         factory: Vec<u8>,
         token0: Vec<u8>,
         token1: Vec<u8>,
         fee: u64,
-        tick_spacing: u64,
+        tick_spacing: i64,
         pool: Vec<u8>,
     ) -> eth::Log {
         eth::Log {
@@ -230,11 +364,22 @@ mod tests {
                 uint_topic(fee),
             ],
             data: ethabi::encode(&[
-                Token::Int(U256::from(tick_spacing)),
+                Token::Int(int24_token(tick_spacing)),
                 Token::Address(Address::from_slice(&pool)),
             ]),
             ordinal: 10,
             ..Default::default()
+        }
+    }
+
+    fn int24_token(value: i64) -> U256 {
+        if value >= 0 {
+            U256::from(value as u64)
+        } else {
+            let mut word = [0xff; 32];
+            let signed = (value as i32).to_be_bytes();
+            word[28..32].copy_from_slice(&signed);
+            U256::from_big_endian(&word)
         }
     }
 
@@ -252,5 +397,17 @@ mod tests {
 
     fn address(seed: u8) -> Vec<u8> {
         vec![seed; 20]
+    }
+
+    fn address_array(seed: u8) -> [u8; 20] {
+        [seed; 20]
+    }
+
+    fn bloom_for(value: &[u8]) -> Vec<u8> {
+        let mut bloom = vec![0; BLOOM_BYTES];
+        for bit in bloom_bit_indexes(value) {
+            bloom[BLOOM_BYTES - 1 - (bit / 8)] |= 1 << (bit % 8);
+        }
+        bloom
     }
 }

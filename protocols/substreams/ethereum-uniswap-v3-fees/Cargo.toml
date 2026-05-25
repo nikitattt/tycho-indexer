@@ -20,6 +20,7 @@ rustc-hash = "2.1.2"
 substreams = "0.5.22"
 substreams-ethereum = "0.9.9"
 substreams-helper = { git = "https://github.com/propeller-heads/tycho-protocol-sdk.git", tag = "0.4.0" }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
 tycho-substreams = { git = "https://github.com/propeller-heads/tycho-protocol-sdk.git", tag = "0.4.0" }
 
 [dev-dependencies]
