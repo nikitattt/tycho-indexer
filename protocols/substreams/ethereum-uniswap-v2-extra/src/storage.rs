@@ -11,24 +11,44 @@ pub const K_LAST_SLOT: [u8; 32] =
 pub const TOTAL_SUPPLY_ATTRIBUTE: &str = "total_supply";
 pub const K_LAST_ATTRIBUTE: &str = "k_last";
 
-pub fn v2_extra_attribute(change: &StorageChange) -> Option<Attribute> {
-    let name = if change.key == TOTAL_SUPPLY_SLOT {
-        TOTAL_SUPPLY_ATTRIBUTE
-    } else if change.key == K_LAST_SLOT {
-        K_LAST_ATTRIBUTE
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum V2ExtraAttribute {
+    TotalSupply,
+    KLast,
+}
+
+impl V2ExtraAttribute {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TotalSupply => TOTAL_SUPPLY_ATTRIBUTE,
+            Self::KLast => K_LAST_ATTRIBUTE,
+        }
+    }
+
+    pub fn attribute(self, value: &[u8]) -> Attribute {
+        Attribute {
+            name: self.name().to_string(),
+            value: BigInt::from_unsigned_bytes_be(value).to_signed_bytes_be(),
+            change: ChangeType::Update.into(),
+        }
+    }
+}
+
+pub fn v2_extra_attribute_kind(change: &StorageChange) -> Option<V2ExtraAttribute> {
+    let kind = if change.key.as_slice() == TOTAL_SUPPLY_SLOT.as_slice() {
+        V2ExtraAttribute::TotalSupply
+    } else if change.key.as_slice() == K_LAST_SLOT.as_slice() {
+        V2ExtraAttribute::KLast
     } else {
         return None;
     };
 
-    if change.old_value == change.new_value {
-        return None;
-    }
+    (change.old_value != change.new_value).then_some(kind)
+}
 
-    Some(Attribute {
-        name: name.to_string(),
-        value: BigInt::from_unsigned_bytes_be(&change.new_value).to_signed_bytes_be(),
-        change: ChangeType::Update.into(),
-    })
+#[cfg(test)]
+pub fn v2_extra_attribute(change: &StorageChange) -> Option<Attribute> {
+    v2_extra_attribute_kind(change).map(|kind| kind.attribute(&change.new_value))
 }
 
 #[cfg(test)]

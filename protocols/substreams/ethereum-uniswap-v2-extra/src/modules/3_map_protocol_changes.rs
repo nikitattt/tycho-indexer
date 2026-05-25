@@ -1,426 +1,285 @@
 use itertools::Itertools;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use std::collections::hash_map::Entry;
 use substreams::store::{StoreGet, StoreGetProto};
 use substreams_ethereum::pb::eth::v2::{self as eth};
-
-use substreams_helper::{event_handler::EventHandler, hex::Hexable};
+use substreams_helper::hex::Hexable;
 
 use crate::{
-    abi::pool::events::Sync, storage::v2_extra_attribute, store_key::StoreKey,
-    traits::PoolAddresser,
+    abi::pool::events::Sync,
+    storage::{v2_extra_attribute_kind, V2ExtraAttribute},
+    store_key::StoreKey,
 };
+use hex_literal::hex;
 use tycho_substreams::prelude::*;
 
-// Auxiliary struct to serve as a key for the HashMaps.
-#[derive(Clone, Hash, Eq, PartialEq)]
-struct ComponentKey<T> {
-    component_id: String,
-    name: T,
-}
-
-impl<T> ComponentKey<T> {
-    fn new(component_id: String, name: T) -> Self {
-        ComponentKey { component_id, name }
-    }
-}
-
-#[derive(Clone)]
-struct PartialChanges {
-    transaction: Transaction,
-    entity_changes: HashMap<ComponentKey<String>, Attribute>,
-    balance_changes: HashMap<ComponentKey<Vec<u8>>, BalanceChange>,
-}
-
-impl PartialChanges {
-    // Consolidate the entity changes into a vector of EntityChanges. Initially, the entity changes
-    // are in a map to prevent duplicates. For each transaction, we need to have only one final
-    // state change, per state. Example:
-    // If we have two sync events for the same pool (in the same tx), we need to have only one final
-    // state change for the reserves. This will be the last sync event, as it is the final state
-    // of the pool after the transaction.
-    fn consolidate_entity_changes(self) -> Vec<EntityChanges> {
-        self.entity_changes
-            .into_iter()
-            .map(|(key, attribute)| (key.component_id, attribute))
-            .into_group_map()
-            .into_iter()
-            .map(|(component_id, attributes)| EntityChanges { component_id, attributes })
-            .collect()
-    }
-}
+const SYNC_TOPIC: [u8; 32] =
+    hex!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
 
 #[substreams::handlers::map]
 pub fn map_protocol_changes(
     block: eth::Block,
-    block_entity_changes: BlockChanges,
+    created_pools: BlockChanges,
     pools_store: StoreGetProto<ProtocolComponent>,
 ) -> Result<BlockChanges, substreams::errors::Error> {
-    // Sync event is sufficient for our use-case. Since it's emitted on every reserve-altering
-    // function call, we can use it as the only event to update the reserves of a pool.
-    let mut block_entity_changes = block_entity_changes;
-    let mut tx_changes: HashMap<Vec<u8>, PartialChanges> = HashMap::new();
-
-    handle_sync(&block, &mut tx_changes, &pools_store);
-    merge_block(&mut tx_changes, &mut block_entity_changes);
-
-    let extra_changes = collect_v2_extra_changes(&block, &pools_store);
-    merge_extra_changes(&mut block_entity_changes, extra_changes);
-
-    block_entity_changes
-        .changes
-        .sort_unstable_by_key(|change| {
-            change
-                .tx
-                .as_ref()
-                .map(|tx| tx.index)
-                .unwrap_or_default()
-        });
-
-    Ok(block_entity_changes)
+    Ok(collect_protocol_changes(&block, created_pools, |address| {
+        pools_store.get_last(pool_store_key(address))
+    }))
 }
 
-/// Handle the sync events and update the reserves of the pools.
-///
-/// This function is called for each block, and it will handle the sync events for each transaction.
-/// On UniswapV2, Sync events are emitted on every reserve-altering function call, so we can use
-/// only this event to keep track of the pool state.
-///
-/// This function also relies on an intermediate HashMap to store the changes for each transaction.
-/// This is necessary because we need to consolidate the changes for each transaction before adding
-/// them to the block_entity_changes. This HashMap prevents us from having duplicate changes for the
-/// same pool and token. See the PartialChanges struct for more details.
-fn handle_sync(
+fn collect_protocol_changes<F>(
     block: &eth::Block,
-    tx_changes: &mut HashMap<Vec<u8>, PartialChanges>,
-    store: &StoreGetProto<ProtocolComponent>,
-) {
-    let mut on_sync = |event: Sync, _tx: &eth::TransactionTrace, _log: &eth::Log| {
-        let pool_address_hex = _log.address.to_hex();
+    created_pools: BlockChanges,
+    mut lookup_pool: F,
+) -> BlockChanges
+where
+    F: FnMut(&[u8]) -> Option<ProtocolComponent>,
+{
+    let block_metadata = created_pools.block;
+    let mut transaction_changes = FxHashMap::default();
 
-        let pool =
-            store.must_get_last(StoreKey::Pool.get_unique_pool_key(pool_address_hex.as_str()));
-        // Convert reserves to bytes
-        let reserves_bytes = [event.reserve0, event.reserve1];
+    for change in created_pools.changes {
+        add_existing_transaction_change(&mut transaction_changes, change);
+    }
 
-        let tx_change = tx_changes
-            .entry(_tx.hash.clone())
-            .or_insert_with(|| PartialChanges {
-                transaction: _tx.into(),
-                entity_changes: HashMap::new(),
-                balance_changes: HashMap::new(),
-            });
+    let mut pool_cache = PoolLookupCache::default();
+    let mut latest_extra_attributes = FxHashMap::default();
 
-        for (i, reserve_bytes) in reserves_bytes.iter().enumerate() {
-            let attribute_name = format!("reserve{}", i);
-            // By using a HashMap, we can overwrite the previous value of the reserve attribute if
-            // it is for the same pool and the same attribute name (reserves).
-            tx_change.entity_changes.insert(
-                ComponentKey::new(pool_address_hex.clone(), attribute_name.clone()),
-                Attribute {
-                    name: attribute_name,
-                    value: reserve_bytes
-                        .clone()
-                        .to_signed_bytes_be(),
-                    change: ChangeType::Update.into(),
-                },
-            );
-        }
-
-        // Update balance changes for each token
-        for (index, token) in pool.tokens.iter().enumerate() {
-            let balance = &reserves_bytes[index];
-            // HashMap also prevents having duplicate balance changes for the same pool and token.
-            tx_change.balance_changes.insert(
-                ComponentKey::new(pool_address_hex.clone(), token.clone()),
-                BalanceChange {
-                    token: token.clone(),
-                    balance: balance.clone().to_signed_bytes_be(),
-                    component_id: pool_address_hex.as_bytes().to_vec(),
-                },
-            );
-        }
-    };
-
-    let mut eh = EventHandler::new(block);
-    // Filter the sync events by the pool address, to make sure we don't process events for other
-    // Protocols that use the same event signature.
-    eh.filter_by_address(PoolAddresser { store });
-    eh.on::<Sync, _>(&mut on_sync);
-    eh.handle_events();
-}
-
-/// Merge the changes from the sync events with the create_pool events previously mapped on
-/// block_entity_changes.
-///
-/// Parameters:
-/// - tx_changes: HashMap with the changes for each transaction. This is the same HashMap used in
-///   handle_sync
-/// - block_entity_changes: The BlockChanges struct that will be updated with the changes from the
-///   sync events.
-///
-/// This HashMap comes pre-filled with the changes for the create_pool events, mapped in
-///   1_map_pool_created.
-///
-/// This function is called after the handle_sync function, and it is expected that
-/// block_entity_changes will be complete after this function ends.
-fn merge_block(
-    tx_changes: &mut HashMap<Vec<u8>, PartialChanges>,
-    block_entity_changes: &mut BlockChanges,
-) {
-    let mut tx_entity_changes_map = HashMap::new();
-
-    // Add created pools to the tx_changes_map
-    for change in block_entity_changes
-        .changes
-        .clone()
-        .into_iter()
+    for tx in block
+        .transaction_traces
+        .iter()
+        .filter(|tx| tx.status == i32::from(eth::TransactionTraceStatus::Succeeded))
     {
-        let transaction = change.tx.as_ref().unwrap();
-        tx_entity_changes_map
-            .entry(transaction.hash.clone())
-            .and_modify(|c: &mut TransactionChanges| {
-                c.component_changes
-                    .extend(change.component_changes.clone());
-                c.entity_changes
-                    .extend(change.entity_changes.clone());
-            })
-            .or_insert(change);
+        add_sync_changes(tx, &mut pool_cache, &mut lookup_pool, &mut transaction_changes);
+        add_extra_changes(tx, &mut pool_cache, &mut lookup_pool, &mut latest_extra_attributes);
     }
 
-    // First, iterate through the previously created transactions, extracted from the
-    // map_pool_created step. If there are sync events for this transaction, add them to the
-    // block_entity_changes and the corresponding balance changes.
-    for change in tx_entity_changes_map.values_mut() {
-        let tx = change
-            .clone()
-            .tx
-            .expect("Transaction not found")
-            .clone();
-
-        // If there are sync events for this transaction, add them to the block_entity_changes
-        if let Some(partial_changes) = tx_changes.remove(&tx.hash) {
-            change.entity_changes = partial_changes
-                .clone()
-                .consolidate_entity_changes();
-            change.balance_changes = partial_changes
-                .balance_changes
-                .into_values()
-                .collect();
-        }
-    }
-
-    // If there are any transactions left in the tx_changes, it means that they are transactions
-    // that changed the state of the pools, but were not included in the block_entity_changes.
-    // This happens for every regular transaction that does not actually create a pool. By the
-    // end of this function, we expect block_entity_changes to be up-to-date with the changes
-    // for all sync and new_pools in the block.
-    for partial_changes in tx_changes.values() {
-        tx_entity_changes_map.insert(
-            partial_changes.transaction.hash.clone(),
-            TransactionChanges {
-                tx: Some(partial_changes.transaction.clone()),
-                contract_changes: vec![],
-                entity_changes: partial_changes
-                    .clone()
-                    .consolidate_entity_changes(),
-                balance_changes: partial_changes
-                    .balance_changes
-                    .clone()
-                    .into_values()
-                    .collect(),
-                component_changes: vec![],
-                ..Default::default()
-            },
-        );
-    }
-
-    block_entity_changes.changes = tx_entity_changes_map
-        .into_values()
-        .collect();
-}
-
-fn collect_v2_extra_changes(
-    block: &eth::Block,
-    pools_store: &StoreGetProto<ProtocolComponent>,
-) -> Vec<TransactionChanges> {
-    let mut latest_attributes: HashMap<(Vec<u8>, String), PendingAttribute> = HashMap::new();
-    let mut known_pools: HashMap<Vec<u8>, bool> = HashMap::new();
-
-    for tx in block.transaction_traces.iter() {
-        if tx.status != i32::from(eth::TransactionTraceStatus::Succeeded) {
-            continue;
-        }
-
-        let mut extra_storage_changes = tx
-            .calls
-            .iter()
-            .filter(|call| !call.state_reverted)
-            .flat_map(|call| call.storage_changes.iter())
-            .filter(|change| v2_extra_attribute(change).is_some())
-            .collect::<Vec<_>>();
-
-        if extra_storage_changes.is_empty() {
-            continue;
-        }
-
-        extra_storage_changes.sort_unstable_by_key(|change| change.ordinal);
-
-        let tycho_tx = Transaction {
-            hash: tx.hash.clone(),
-            from: tx.from.clone(),
-            to: tx.to.clone(),
-            index: tx.index.into(),
-        };
-
-        for storage_change in extra_storage_changes {
-            if !is_known_pool_cached(&storage_change.address, &mut known_pools, pools_store) {
-                continue;
-            }
-
-            let Some(attribute) = v2_extra_attribute(storage_change) else {
-                continue;
-            };
-            let component_id = storage_change.address.to_hex();
-
-            latest_attributes.insert(
-                (storage_change.address.clone(), attribute.name.clone()),
-                PendingAttribute {
-                    tx: tycho_tx.clone(),
-                    component_id,
-                    attribute,
-                    order: (tycho_tx.index, storage_change.ordinal),
-                },
-            );
-        }
-    }
-
-    let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
-    for pending in latest_attributes
+    for pending in latest_extra_attributes
         .into_values()
         .sorted_unstable_by_key(|pending| pending.order)
     {
-        let builder = transaction_changes
-            .entry(pending.tx.index)
-            .or_insert_with(|| TransactionChangesBuilder::new(&pending.tx));
-
+        let builder = transaction_builder(&mut transaction_changes, &pending.tx);
         builder.add_entity_change(&EntityChanges {
             component_id: pending.component_id,
             attributes: vec![pending.attribute],
         });
     }
 
-    transaction_changes
-        .drain()
-        .sorted_unstable_by_key(|(index, _)| *index)
-        .filter_map(|(_, builder)| builder.build())
-        .collect::<Vec<_>>()
-}
-
-fn is_known_pool_cached(
-    address: &[u8],
-    known_pools: &mut HashMap<Vec<u8>, bool>,
-    pools_store: &StoreGetProto<ProtocolComponent>,
-) -> bool {
-    if let Some(is_known) = known_pools.get(address) {
-        return *is_known;
-    }
-
-    let pool_address = format!("0x{}", hex::encode(address));
-    let is_known = pools_store
-        .get_last(StoreKey::Pool.get_unique_pool_key(pool_address.as_str()))
-        .is_some();
-    known_pools.insert(address.to_vec(), is_known);
-    is_known
-}
-
-fn merge_extra_changes(block_changes: &mut BlockChanges, extra_changes: Vec<TransactionChanges>) {
-    let mut transaction_changes: HashMap<u64, TransactionChanges> = HashMap::new();
-    merge_block_changes(std::mem::take(&mut block_changes.changes), &mut transaction_changes);
-    merge_block_changes(extra_changes, &mut transaction_changes);
-
-    block_changes.changes = transaction_changes
-        .drain()
-        .sorted_unstable_by_key(|(index, _)| *index)
-        .map(|(_, changes)| changes)
-        .collect();
-}
-
-fn merge_block_changes(
-    changes: Vec<TransactionChanges>,
-    transaction_changes: &mut HashMap<u64, TransactionChanges>,
-) {
-    for change in changes {
-        let Some(tx) = change.tx.clone() else {
-            continue;
-        };
-
-        transaction_changes
-            .entry(tx.index)
-            .and_modify(|existing| merge_transaction_change(existing, change.clone()))
-            .or_insert(change);
+    BlockChanges {
+        block: block_metadata,
+        changes: transaction_changes
+            .drain()
+            .sorted_unstable_by_key(|(index, _)| *index)
+            .filter_map(|(_, builder)| builder.build())
+            .collect(),
     }
 }
 
-fn merge_transaction_change(existing: &mut TransactionChanges, incoming: TransactionChanges) {
-    existing
-        .contract_changes
-        .extend(incoming.contract_changes);
-
-    for entity_change in incoming.entity_changes {
-        merge_entity_change(&mut existing.entity_changes, entity_change);
-    }
-
-    for component in incoming.component_changes {
-        upsert_component(&mut existing.component_changes, component);
-    }
-
-    for balance_change in incoming.balance_changes {
-        upsert_balance_change(&mut existing.balance_changes, balance_change);
-    }
-}
-
-fn merge_entity_change(existing: &mut Vec<EntityChanges>, incoming: EntityChanges) {
-    let Some(entity_change) = existing
-        .iter_mut()
-        .find(|change| change.component_id == incoming.component_id)
-    else {
-        existing.push(incoming);
+fn add_sync_changes<F>(
+    tx: &eth::TransactionTrace,
+    pool_cache: &mut PoolLookupCache,
+    lookup_pool: &mut F,
+    transaction_changes: &mut FxHashMap<u64, TransactionChangesBuilder>,
+) where
+    F: FnMut(&[u8]) -> Option<ProtocolComponent>,
+{
+    let Some(receipt) = tx.receipt.as_ref() else {
         return;
     };
 
-    for attribute in incoming.attributes {
-        match entity_change
-            .attributes
-            .iter_mut()
-            .find(|existing_attribute| existing_attribute.name == attribute.name)
-        {
-            Some(existing_attribute) => *existing_attribute = attribute,
-            None => entity_change.attributes.push(attribute),
+    for log in &receipt.logs {
+        if !is_sync_log(log) {
+            continue;
+        }
+
+        let Some(pool) = pool_cache.get_or_lookup(&log.address, lookup_pool) else {
+            continue;
+        };
+        let Ok(sync) = Sync::decode(log) else {
+            continue;
+        };
+
+        let component_id = log.address.to_hex();
+        let reserve0 = sync.reserve0.to_signed_bytes_be();
+        let reserve1 = sync.reserve1.to_signed_bytes_be();
+        let builder = transaction_builder_for_trace(transaction_changes, tx);
+
+        builder.add_entity_change(&EntityChanges {
+            component_id: component_id.clone(),
+            attributes: vec![
+                Attribute {
+                    name: "reserve0".to_string(),
+                    value: reserve0.clone(),
+                    change: ChangeType::Update.into(),
+                },
+                Attribute {
+                    name: "reserve1".to_string(),
+                    value: reserve1.clone(),
+                    change: ChangeType::Update.into(),
+                },
+            ],
+        });
+
+        if let Some(token0) = pool.tokens.first() {
+            builder.add_balance_change(&BalanceChange {
+                token: token0.clone(),
+                balance: reserve0,
+                component_id: component_id.as_bytes().to_vec(),
+            });
+        }
+        if let Some(token1) = pool.tokens.get(1) {
+            builder.add_balance_change(&BalanceChange {
+                token: token1.clone(),
+                balance: reserve1,
+                component_id: component_id.as_bytes().to_vec(),
+            });
         }
     }
 }
 
-fn upsert_component(existing: &mut Vec<ProtocolComponent>, incoming: ProtocolComponent) {
-    if existing
-        .iter()
-        .any(|component| component.id == incoming.id)
-    {
-        return;
-    }
+fn add_extra_changes<F>(
+    tx: &eth::TransactionTrace,
+    pool_cache: &mut PoolLookupCache,
+    lookup_pool: &mut F,
+    latest_extra_attributes: &mut FxHashMap<PendingAttributeKey, PendingAttribute>,
+) where
+    F: FnMut(&[u8]) -> Option<ProtocolComponent>,
+{
+    let mut tycho_tx: Option<Transaction> = None;
 
-    existing.push(incoming);
+    for call in &tx.calls {
+        if call.state_reverted || call.storage_changes.is_empty() {
+            continue;
+        }
+
+        for storage_change in &call.storage_changes {
+            let Some(kind) = v2_extra_attribute_kind(storage_change) else {
+                continue;
+            };
+            let Some(pool_key) = address_key(&storage_change.address) else {
+                continue;
+            };
+            let Some(pool) = pool_cache.get_or_lookup(&storage_change.address, lookup_pool) else {
+                continue;
+            };
+
+            let order = (tx.index as u64, storage_change.ordinal);
+            let key = PendingAttributeKey { pool: pool_key, kind };
+            let pending = PendingAttribute {
+                tx: tycho_tx
+                    .get_or_insert_with(|| tx.into())
+                    .clone(),
+                component_id: pool.id.clone(),
+                attribute: kind.attribute(&storage_change.new_value),
+                order,
+            };
+
+            match latest_extra_attributes.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    if order > entry.get().order {
+                        entry.insert(pending);
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(pending);
+                }
+            }
+        }
+    }
 }
 
-fn upsert_balance_change(existing: &mut Vec<BalanceChange>, incoming: BalanceChange) {
-    match existing
-        .iter_mut()
-        .find(|balance_change| {
-            balance_change.component_id == incoming.component_id
-                && balance_change.token == incoming.token
-        }) {
-        Some(balance_change) => *balance_change = incoming,
-        None => existing.push(incoming),
+fn add_existing_transaction_change(
+    transaction_changes: &mut FxHashMap<u64, TransactionChangesBuilder>,
+    change: TransactionChanges,
+) {
+    let Some(tx) = change.tx.as_ref() else {
+        return;
+    };
+
+    let builder = transaction_builder(transaction_changes, tx);
+
+    for entity_change in &change.entity_changes {
+        builder.add_entity_change(entity_change);
     }
+    for component in &change.component_changes {
+        builder.add_protocol_component(component);
+    }
+    for balance_change in &change.balance_changes {
+        builder.add_balance_change(balance_change);
+    }
+}
+
+fn transaction_builder_for_trace<'a>(
+    transaction_changes: &'a mut FxHashMap<u64, TransactionChangesBuilder>,
+    tx: &eth::TransactionTrace,
+) -> &'a mut TransactionChangesBuilder {
+    transaction_changes
+        .entry(tx.index.into())
+        .or_insert_with(|| TransactionChangesBuilder::new(&tx.into()))
+}
+
+fn transaction_builder<'a>(
+    transaction_changes: &'a mut FxHashMap<u64, TransactionChangesBuilder>,
+    tx: &Transaction,
+) -> &'a mut TransactionChangesBuilder {
+    transaction_changes
+        .entry(tx.index)
+        .or_insert_with(|| TransactionChangesBuilder::new(tx))
+}
+
+fn is_sync_log(log: &eth::Log) -> bool {
+    log.topics.len() == 1
+        && log.data.len() == 64
+        && log.topics[0].as_slice() == SYNC_TOPIC.as_slice()
+}
+
+fn pool_store_key(address: &[u8]) -> String {
+    StoreKey::Pool.get_unique_pool_key(&hex_address(address))
+}
+
+fn hex_address(address: &[u8]) -> String {
+    format!("0x{}", hex::encode(address))
+}
+
+fn address_key(address: &[u8]) -> Option<[u8; 20]> {
+    if address.len() != 20 {
+        return None;
+    }
+
+    let mut key = [0u8; 20];
+    key.copy_from_slice(address);
+    Some(key)
+}
+
+#[derive(Default)]
+struct PoolLookupCache {
+    pools: FxHashMap<[u8; 20], Option<ProtocolComponent>>,
+}
+
+impl PoolLookupCache {
+    fn get_or_lookup<F>(
+        &mut self,
+        address: &[u8],
+        lookup_pool: &mut F,
+    ) -> Option<&ProtocolComponent>
+    where
+        F: FnMut(&[u8]) -> Option<ProtocolComponent>,
+    {
+        let key = address_key(address)?;
+
+        match self.pools.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut().as_ref(),
+            Entry::Vacant(entry) => entry
+                .insert(lookup_pool(address))
+                .as_ref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PendingAttributeKey {
+    pool: [u8; 20],
+    kind: V2ExtraAttribute,
 }
 
 struct PendingAttribute {
@@ -428,4 +287,236 @@ struct PendingAttribute {
     component_id: String,
     attribute: Attribute,
     order: (u64, u64),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{K_LAST_ATTRIBUTE, K_LAST_SLOT, TOTAL_SUPPLY_SLOT};
+    use substreams::scalar::BigInt;
+
+    const TRANSFER_TOPIC: [u8; 32] =
+        hex!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
+
+    #[test]
+    fn skips_non_sync_logs_before_pool_lookup() {
+        let pool = address(1);
+        let block = block_with_transactions(vec![transaction(
+            0,
+            vec![eth::Log {
+                address: pool,
+                topics: vec![TRANSFER_TOPIC.to_vec(), word(2), word(3)],
+                data: word(1),
+                ordinal: 10,
+                ..Default::default()
+            }],
+            Vec::new(),
+        )]);
+        let mut lookups = 0;
+
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |_| {
+            lookups += 1;
+            None
+        });
+
+        assert_eq!(lookups, 0);
+        assert!(changes.changes.is_empty());
+    }
+
+    #[test]
+    fn caches_pool_lookup_hits_and_keeps_latest_sync_per_transaction() {
+        let pool = address(1);
+        let block = block_with_transactions(vec![transaction(
+            0,
+            vec![sync_log(pool.clone(), 1, 2, 10), sync_log(pool.clone(), 3, 4, 11)],
+            Vec::new(),
+        )]);
+        let mut lookups = 0;
+
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |address| {
+            lookups += 1;
+            (address == pool.as_slice()).then(|| protocol_component(&pool))
+        });
+
+        assert_eq!(lookups, 1);
+        assert_eq!(attribute_value(&changes, &pool, "reserve0"), BigInt::from(3));
+        assert_eq!(attribute_value(&changes, &pool, "reserve1"), BigInt::from(4));
+        assert_eq!(balance_value(&changes, &pool, &token0()), BigInt::from(3));
+        assert_eq!(balance_value(&changes, &pool, &token1()), BigInt::from(4));
+    }
+
+    #[test]
+    fn caches_pool_lookup_misses_for_sync_shaped_logs() {
+        let pool = address(1);
+        let block = block_with_transactions(vec![transaction(
+            0,
+            vec![sync_log(pool.clone(), 1, 2, 10), sync_log(pool.clone(), 3, 4, 11)],
+            Vec::new(),
+        )]);
+        let mut lookups = 0;
+
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |_| {
+            lookups += 1;
+            None
+        });
+
+        assert_eq!(lookups, 1);
+        assert!(changes.changes.is_empty());
+    }
+
+    #[test]
+    fn repeated_extra_updates_keep_latest_by_ordinal() {
+        let pool = address(1);
+        let block = block_with_transactions(vec![transaction(
+            0,
+            Vec::new(),
+            vec![call(vec![
+                storage_change(&pool, K_LAST_SLOT, 1, 2, 10),
+                storage_change(&pool, K_LAST_SLOT, 2, 3, 20),
+            ])],
+        )]);
+        let mut lookups = 0;
+
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |address| {
+            lookups += 1;
+            (address == pool.as_slice()).then(|| protocol_component(&pool))
+        });
+
+        assert_eq!(lookups, 1);
+        assert_eq!(attribute_value(&changes, &pool, K_LAST_ATTRIBUTE), BigInt::from(3));
+    }
+
+    #[test]
+    fn skips_failed_transactions_and_reverted_calls() {
+        let pool = address(1);
+        let failed = eth::TransactionTrace {
+            status: i32::from(eth::TransactionTraceStatus::Failed),
+            calls: vec![call(vec![storage_change(&pool, K_LAST_SLOT, 1, 2, 10)])],
+            receipt: Some(eth::TransactionReceipt {
+                logs: vec![sync_log(pool.clone(), 1, 2, 10)],
+                ..Default::default()
+            }),
+            ..transaction(0, Vec::new(), Vec::new())
+        };
+        let reverted_call = eth::Call {
+            state_reverted: true,
+            storage_changes: vec![storage_change(&pool, TOTAL_SUPPLY_SLOT, 1, 2, 10)],
+            ..Default::default()
+        };
+        let block =
+            block_with_transactions(vec![failed, transaction(1, Vec::new(), vec![reverted_call])]);
+        let mut lookups = 0;
+
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |_| {
+            lookups += 1;
+            Some(protocol_component(&pool))
+        });
+
+        assert_eq!(lookups, 0);
+        assert!(changes.changes.is_empty());
+    }
+
+    fn block_with_transactions(transactions: Vec<eth::TransactionTrace>) -> eth::Block {
+        eth::Block { transaction_traces: transactions, ..Default::default() }
+    }
+
+    fn transaction(
+        index: u32,
+        logs: Vec<eth::Log>,
+        calls: Vec<eth::Call>,
+    ) -> eth::TransactionTrace {
+        eth::TransactionTrace {
+            index,
+            status: i32::from(eth::TransactionTraceStatus::Succeeded),
+            hash: vec![index as u8; 32],
+            from: address(7),
+            to: address(8),
+            receipt: Some(eth::TransactionReceipt { logs, ..Default::default() }),
+            calls,
+            ..Default::default()
+        }
+    }
+
+    fn call(storage_changes: Vec<eth::StorageChange>) -> eth::Call {
+        eth::Call { storage_changes, ..Default::default() }
+    }
+
+    fn sync_log(address: Vec<u8>, reserve0: u64, reserve1: u64, ordinal: u64) -> eth::Log {
+        let mut data = word(reserve0);
+        data.extend(word(reserve1));
+
+        eth::Log { address, topics: vec![SYNC_TOPIC.to_vec()], data, ordinal, ..Default::default() }
+    }
+
+    fn storage_change(
+        address: &[u8],
+        key: [u8; 32],
+        old_value: u64,
+        new_value: u64,
+        ordinal: u64,
+    ) -> eth::StorageChange {
+        eth::StorageChange {
+            address: address.to_vec(),
+            key: key.to_vec(),
+            old_value: word(old_value),
+            new_value: word(new_value),
+            ordinal,
+        }
+    }
+
+    fn protocol_component(pool: &[u8]) -> ProtocolComponent {
+        ProtocolComponent {
+            id: hex_address(pool),
+            tokens: vec![token0(), token1()],
+            ..Default::default()
+        }
+    }
+
+    fn attribute_value(changes: &BlockChanges, pool: &[u8], name: &str) -> BigInt {
+        let component_id = hex_address(pool);
+        let attribute = changes
+            .changes
+            .iter()
+            .flat_map(|tx| tx.entity_changes.iter())
+            .find(|entity| entity.component_id == component_id)
+            .and_then(|entity| {
+                entity
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.name == name)
+            })
+            .unwrap_or_else(|| panic!("missing attribute {name}"));
+
+        BigInt::from_signed_bytes_be(&attribute.value)
+    }
+
+    fn balance_value(changes: &BlockChanges, pool: &[u8], token: &[u8]) -> BigInt {
+        let component_id = hex_address(pool).as_bytes().to_vec();
+        let balance = changes
+            .changes
+            .iter()
+            .flat_map(|tx| tx.balance_changes.iter())
+            .find(|balance| balance.component_id == component_id && balance.token == token)
+            .unwrap_or_else(|| panic!("missing balance change"));
+
+        BigInt::from_signed_bytes_be(&balance.balance)
+    }
+
+    fn address(seed: u8) -> Vec<u8> {
+        vec![seed; 20]
+    }
+
+    fn token0() -> Vec<u8> {
+        address(10)
+    }
+
+    fn token1() -> Vec<u8> {
+        address(11)
+    }
+
+    fn word(value: u64) -> Vec<u8> {
+        let mut word = vec![0; 32];
+        word[24..32].copy_from_slice(&value.to_be_bytes());
+        word
+    }
 }

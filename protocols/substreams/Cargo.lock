@@ -1085,11 +1085,13 @@ dependencies = [
  "itertools 0.12.1",
  "num-bigint",
  "prost 0.11.9",
+ "rustc-hash",
  "serde",
  "serde_qs 0.13.0",
  "substreams 0.5.22",
  "substreams-ethereum 0.9.13",
  "substreams-helper 0.0.2 (git+https://github.com/propeller-heads/tycho-protocol-sdk.git?rev=b8aeaa3)",
+ "tiny-keccak",
  "tycho-substreams 0.2.0 (git+https://github.com/propeller-heads/tycho-protocol-sdk.git?rev=b8aeaa3)",
 ]
 
