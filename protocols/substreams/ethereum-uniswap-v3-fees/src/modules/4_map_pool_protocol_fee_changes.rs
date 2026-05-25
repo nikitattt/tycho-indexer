@@ -49,18 +49,11 @@ fn event_pools_by_tx(events: &Events) -> HashMap<u64, HashSet<Vec<u8>>> {
         let Some(tx) = &event.transaction else {
             continue;
         };
-        let Ok(pool) = hex::decode(
-            event
-                .pool_address
-                .trim_start_matches("0x"),
-        ) else {
-            continue;
-        };
 
         pools_by_tx
             .entry(tx.index)
             .or_insert_with(HashSet::new)
-            .insert(pool);
+            .insert(event.pool_address.clone());
     }
 
     pools_by_tx
@@ -188,7 +181,7 @@ mod tests {
 
     #[test]
     fn emits_protocol_fee_storage_attributes_for_event_known_pool_without_store_lookup() {
-        let pool = pool_address(1);
+        let pool = pool_bytes(1);
         let storage_change = protocol_fee_storage_change(pool_bytes(1), 10, 1, 2, 3, 4);
         let events = Events { pool_events: vec![swap_event(pool.clone(), 1)] };
 
@@ -218,7 +211,7 @@ mod tests {
 
     #[test]
     fn keeps_latest_protocol_fee_attribute_by_transaction_and_ordinal() {
-        let pool = pool_address(1);
+        let pool = pool_bytes(1);
         let events = Events { pool_events: vec![swap_event(pool.clone(), 1)] };
 
         let changes = collect_pool_protocol_fee_changes(
@@ -242,7 +235,7 @@ mod tests {
 
     #[test]
     fn skips_protocol_fee_storage_changes_outside_event_pool_calls() {
-        let pool = pool_address(1);
+        let pool = pool_bytes(1);
         let events = Events { pool_events: vec![swap_event(pool.clone(), 1)] };
 
         let changes = collect_pool_protocol_fee_changes(
@@ -293,9 +286,9 @@ mod tests {
 
     fn attributes_for_pool(
         changes: &tycho_substreams::prelude::BlockEntityChanges,
-        pool: &str,
+        pool: &[u8],
     ) -> Vec<tycho_substreams::prelude::Attribute> {
-        let component_id = format!("0x{pool}");
+        let component_id = pool.to_hex();
         changes
             .changes
             .iter()
@@ -359,19 +352,19 @@ mod tests {
         value
     }
 
-    fn swap_event(pool_address: String, ordinal: u64) -> PoolEvent {
+    fn swap_event(pool_address: Vec<u8>, ordinal: u64) -> PoolEvent {
         PoolEvent {
             pool_address,
             log_ordinal: ordinal,
             transaction: Some(tx(ordinal)),
             r#type: Some(Type::Swap(pool_event::Swap {
-                sqrt_price: "0".to_string(),
+                sqrt_price: amount(0),
                 tick: 0,
-                liquidity: "0".to_string(),
-                amount_0: "0".to_string(),
-                amount_1: "0".to_string(),
-                sender: String::new(),
-                recipient: String::new(),
+                liquidity: amount(0),
+                amount_0: amount(0),
+                amount_1: amount(0),
+                sender: Vec::new(),
+                recipient: Vec::new(),
             })),
             ..Default::default()
         }
@@ -381,8 +374,8 @@ mod tests {
         Transaction { index, hash: vec![index as u8; 32], ..Default::default() }
     }
 
-    fn pool_address(seed: u8) -> String {
-        hex::encode(pool_bytes(seed))
+    fn amount(value: i64) -> Vec<u8> {
+        BigInt::from(value).to_signed_bytes_be()
     }
 
     fn pool_bytes(seed: u8) -> Vec<u8> {

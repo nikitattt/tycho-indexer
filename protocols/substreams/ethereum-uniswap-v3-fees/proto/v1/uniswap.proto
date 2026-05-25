@@ -78,80 +78,80 @@ message Events {
       CollectProtocol collect_protocol = 8;
     }
     uint64 log_ordinal = 100;
-    string pool_address = 102;
-    string token0 = 103;
-    string token1 = 104;
+    bytes pool_address = 102;
+    bytes token0 = 103;
+    bytes token1 = 104;
     Transaction transaction = 105;
 
     message Initialize {
       // Unsigned
-      string sqrt_price = 1;
+      bytes sqrt_price = 1;
       int32 tick = 2;
     }
 
     message Mint {
-      string sender = 1;
-      string owner = 2;
+      bytes sender = 1;
+      bytes owner = 2;
       // Signed
       int32 tick_lower = 3;
       // Signed
       int32 tick_upper = 4;
       // Unsigned
-      string amount = 5;
+      bytes amount = 5;
       // Unsigned
-      string amount_0 = 6;
+      bytes amount_0 = 6;
       // Unsigned
-      string amount_1 = 7;
+      bytes amount_1 = 7;
     }
 
     message Collect {
-      string owner = 1;
-      string recipient = 2;
+      bytes owner = 1;
+      bytes recipient = 2;
       int32 tick_lower = 3;
       int32 tick_upper = 4;
       // Unsigned
-      string amount_0 = 5;
+      bytes amount_0 = 5;
       // Unsigned
-      string amount_1 = 6;
+      bytes amount_1 = 6;
     }
 
     message Burn {
-      string owner = 1;
+      bytes owner = 1;
       int32 tick_lower = 2;
       int32 tick_upper = 3;
       // Unsigned
-      string amount = 4;
+      bytes amount = 4;
       // Unsigned
-      string amount_0 = 5;
+      bytes amount_0 = 5;
       // Unsigned
-      string amount_1 = 6;
+      bytes amount_1 = 6;
     }
 
     message Swap {
-      string sender = 1;
-      string recipient = 2;
+      bytes sender = 1;
+      bytes recipient = 2;
       // Signed
-      string amount_0 = 3;
+      bytes amount_0 = 3;
       // Signed
-      string amount_1 = 4;
+      bytes amount_1 = 4;
       // Unsigned
-      string sqrt_price = 6;
+      bytes sqrt_price = 6;
       // Unsigned
-      string liquidity = 7;
+      bytes liquidity = 7;
       int32 tick = 8;
     }
 
     message Flash {
-      string sender = 1;
-      string recipient = 2;
+      bytes sender = 1;
+      bytes recipient = 2;
       // Unsigned
-      string amount_0 = 3;
+      bytes amount_0 = 3;
       // Unsigned
-      string amount_1 = 4;
+      bytes amount_1 = 4;
       // Unsigned
-      string paid_0 = 5;
+      bytes paid_0 = 5;
       // Unsigned
-      string paid_1 = 6;
+      bytes paid_1 = 6;
     }
 
     message SetFeeProtocol {
@@ -166,12 +166,12 @@ message Events {
     }
 
     message CollectProtocol {
-      string sender = 1;
-      string recipient = 2;
+      bytes sender = 1;
+      bytes recipient = 2;
       // Unsigned
-      string amount_0 = 3;
+      bytes amount_0 = 3;
       // Unsigned
-      string amount_1 = 4;
+      bytes amount_1 = 4;
     }
   }
 }

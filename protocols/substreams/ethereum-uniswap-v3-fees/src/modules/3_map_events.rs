@@ -13,10 +13,7 @@ use crate::{
 };
 use anyhow::Ok;
 use std::collections::{hash_map::Entry, HashMap};
-use substreams::{
-    store::{StoreGet, StoreGetProto},
-    Hex,
-};
+use substreams::store::{StoreGet, StoreGetProto};
 use substreams_ethereum::pb::eth::v2::{self as eth, Log, TransactionTrace};
 
 #[substreams::handlers::map]
@@ -133,7 +130,7 @@ fn log_to_event(
                 pool,
                 tx,
                 Type::Initialize(pool_event::Initialize {
-                    sqrt_price: init.sqrt_price_x96.to_string(),
+                    sqrt_price: init.sqrt_price_x96.to_signed_bytes_be(),
                     tick: init.tick.into(),
                 }),
             ))
@@ -145,12 +142,12 @@ fn log_to_event(
                 pool,
                 tx,
                 Type::Swap(pool_event::Swap {
-                    sender: Hex(swap.sender).to_string(),
-                    recipient: Hex(swap.recipient).to_string(),
-                    amount_0: swap.amount0.to_string(),
-                    amount_1: swap.amount1.to_string(),
-                    sqrt_price: swap.sqrt_price_x96.to_string(),
-                    liquidity: swap.liquidity.to_string(),
+                    sender: swap.sender,
+                    recipient: swap.recipient,
+                    amount_0: swap.amount0.to_signed_bytes_be(),
+                    amount_1: swap.amount1.to_signed_bytes_be(),
+                    sqrt_price: swap.sqrt_price_x96.to_signed_bytes_be(),
+                    liquidity: swap.liquidity.to_signed_bytes_be(),
                     tick: swap.tick.into(),
                 }),
             ))
@@ -162,12 +159,12 @@ fn log_to_event(
                 pool,
                 tx,
                 Type::Flash(pool_event::Flash {
-                    sender: Hex(flash.sender).to_string(),
-                    recipient: Hex(flash.recipient).to_string(),
-                    amount_0: flash.amount0.to_string(),
-                    amount_1: flash.amount1.to_string(),
-                    paid_0: flash.paid0.to_string(),
-                    paid_1: flash.paid1.to_string(),
+                    sender: flash.sender,
+                    recipient: flash.recipient,
+                    amount_0: flash.amount0.to_signed_bytes_be(),
+                    amount_1: flash.amount1.to_signed_bytes_be(),
+                    paid_0: flash.paid0.to_signed_bytes_be(),
+                    paid_1: flash.paid1.to_signed_bytes_be(),
                 }),
             ))
         }
@@ -178,13 +175,13 @@ fn log_to_event(
                 pool,
                 tx,
                 Type::Mint(pool_event::Mint {
-                    sender: Hex(mint.sender).to_string(),
-                    owner: Hex(mint.owner).to_string(),
+                    sender: mint.sender,
+                    owner: mint.owner,
                     tick_lower: mint.tick_lower.into(),
                     tick_upper: mint.tick_upper.into(),
-                    amount: mint.amount.to_string(),
-                    amount_0: mint.amount0.to_string(),
-                    amount_1: mint.amount1.to_string(),
+                    amount: mint.amount.to_signed_bytes_be(),
+                    amount_0: mint.amount0.to_signed_bytes_be(),
+                    amount_1: mint.amount1.to_signed_bytes_be(),
                 }),
             ))
         }
@@ -195,12 +192,12 @@ fn log_to_event(
                 pool,
                 tx,
                 Type::Burn(pool_event::Burn {
-                    owner: Hex(burn.owner).to_string(),
+                    owner: burn.owner,
                     tick_lower: burn.tick_lower.into(),
                     tick_upper: burn.tick_upper.into(),
-                    amount: burn.amount.to_string(),
-                    amount_0: burn.amount0.to_string(),
-                    amount_1: burn.amount1.to_string(),
+                    amount: burn.amount.to_signed_bytes_be(),
+                    amount_0: burn.amount0.to_signed_bytes_be(),
+                    amount_1: burn.amount1.to_signed_bytes_be(),
                 }),
             ))
         }
@@ -211,12 +208,12 @@ fn log_to_event(
                 pool,
                 tx,
                 Type::Collect(pool_event::Collect {
-                    owner: Hex(collect.owner).to_string(),
-                    recipient: Hex(collect.recipient).to_string(),
+                    owner: collect.owner,
+                    recipient: collect.recipient,
                     tick_lower: collect.tick_lower.into(),
                     tick_upper: collect.tick_upper.into(),
-                    amount_0: collect.amount0.to_string(),
-                    amount_1: collect.amount1.to_string(),
+                    amount_0: collect.amount0.to_signed_bytes_be(),
+                    amount_1: collect.amount1.to_signed_bytes_be(),
                 }),
             ))
         }
@@ -241,10 +238,10 @@ fn log_to_event(
                 pool,
                 tx,
                 Type::CollectProtocol(pool_event::CollectProtocol {
-                    sender: Hex(cp.sender).to_string(),
-                    recipient: Hex(cp.recipient).to_string(),
-                    amount_0: cp.amount0.to_string(),
-                    amount_1: cp.amount1.to_string(),
+                    sender: cp.sender,
+                    recipient: cp.recipient,
+                    amount_0: cp.amount0.to_signed_bytes_be(),
+                    amount_1: cp.amount1.to_signed_bytes_be(),
                 }),
             ))
         }
@@ -254,9 +251,9 @@ fn log_to_event(
 fn pool_event(event: &Log, pool: &Pool, tx: &TransactionTrace, r#type: Type) -> PoolEvent {
     PoolEvent {
         log_ordinal: event.ordinal,
-        pool_address: Hex(pool.address.clone()).to_string(),
-        token0: Hex(pool.token0.clone()).to_string(),
-        token1: Hex(pool.token1.clone()).to_string(),
+        pool_address: pool.address.clone(),
+        token0: pool.token0.clone(),
+        token1: pool.token1.clone(),
         transaction: Some(tx.into()),
         r#type: Some(r#type),
     }
@@ -266,6 +263,7 @@ fn pool_event(event: &Log, pool: &Pool, tx: &TransactionTrace, r#type: Type) -> 
 mod tests {
     use super::*;
     use hex_literal::hex;
+    use substreams::scalar::BigInt;
 
     const SWAP_TOPIC: [u8; 32] =
         hex!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
@@ -341,6 +339,25 @@ mod tests {
             ..Default::default()
         };
         assert!(classify_v3_pool_event_log(&malformed_swap).is_none());
+    }
+
+    #[test]
+    fn emits_pool_event_metadata_and_amounts_as_bytes() {
+        let tx = tx_trace(8);
+        let log = swap_log(pool_address(1), 11);
+        let mut cache = PoolLookupCache::default();
+
+        let event = event_from_known_pool_log(&log, &tx, &mut cache, |_| Some(pool(1))).unwrap();
+
+        assert_eq!(event.pool_address, pool_address(1));
+        assert_eq!(event.token0, pool_address(11));
+        assert_eq!(event.token1, pool_address(21));
+
+        let Type::Swap(swap) = event.r#type.unwrap() else {
+            panic!("expected swap event");
+        };
+        assert_eq!(BigInt::from_signed_bytes_be(&swap.amount_0), BigInt::from(0));
+        assert_eq!(BigInt::from_signed_bytes_be(&swap.liquidity), BigInt::from(0));
     }
 
     fn swap_log(address: Vec<u8>, ordinal: u64) -> Log {

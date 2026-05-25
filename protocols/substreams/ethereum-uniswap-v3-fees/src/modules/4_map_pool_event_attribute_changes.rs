@@ -3,7 +3,7 @@ use crate::pb::uniswap::v3::{
     Events,
 };
 use itertools::Itertools;
-use std::{collections::HashMap, str::FromStr};
+use std::collections::HashMap;
 use substreams::scalar::BigInt;
 use substreams_helper::hex::Hexable;
 use tycho_substreams::prelude::*;
@@ -55,24 +55,21 @@ fn add_event_attribute_changes(
                 .as_ref()
                 .unwrap()
                 .into();
-            let pool_address = hex::decode(&event.pool_address).unwrap();
 
             add_pool_attribute(
                 transaction_changes,
                 &tx,
-                &pool_address,
+                &event.pool_address,
                 Attribute {
                     name: "sqrt_price_x96".to_string(),
-                    value: BigInt::from_str(&initialize.sqrt_price)
-                        .unwrap()
-                        .to_signed_bytes_be(),
+                    value: initialize.sqrt_price.clone(),
                     change: ChangeType::Update.into(),
                 },
             );
             add_pool_attribute(
                 transaction_changes,
                 &tx,
-                &pool_address,
+                &event.pool_address,
                 Attribute {
                     name: "tick".to_string(),
                     value: BigInt::from(initialize.tick).to_signed_bytes_be(),
@@ -86,24 +83,21 @@ fn add_event_attribute_changes(
                 .as_ref()
                 .unwrap()
                 .into();
-            let pool_address = hex::decode(&event.pool_address).unwrap();
 
             add_pool_attribute(
                 transaction_changes,
                 &tx,
-                &pool_address,
+                &event.pool_address,
                 Attribute {
                     name: "sqrt_price_x96".to_string(),
-                    value: BigInt::from_str(&swap.sqrt_price)
-                        .unwrap()
-                        .to_signed_bytes_be(),
+                    value: swap.sqrt_price.clone(),
                     change: ChangeType::Update.into(),
                 },
             );
             add_pool_attribute(
                 transaction_changes,
                 &tx,
-                &pool_address,
+                &event.pool_address,
                 Attribute {
                     name: "tick".to_string(),
                     value: BigInt::from(swap.tick).to_signed_bytes_be(),
@@ -117,12 +111,11 @@ fn add_event_attribute_changes(
                 .as_ref()
                 .unwrap()
                 .into();
-            let pool_address = hex::decode(&event.pool_address).unwrap();
 
             add_pool_attribute(
                 transaction_changes,
                 &tx,
-                &pool_address,
+                &event.pool_address,
                 Attribute {
                     name: "fee_protocol/token0".to_string(),
                     value: BigInt::from(sfp.fee_protocol_0_new).to_signed_bytes_be(),
@@ -132,7 +125,7 @@ fn add_event_attribute_changes(
             add_pool_attribute(
                 transaction_changes,
                 &tx,
-                &pool_address,
+                &event.pool_address,
                 Attribute {
                     name: "fee_protocol/token1".to_string(),
                     value: BigInt::from(sfp.fee_protocol_1_new).to_signed_bytes_be(),
@@ -193,9 +186,9 @@ mod tests {
 
     fn attributes_for_pool(
         changes: &tycho_substreams::prelude::BlockEntityChanges,
-        pool: &str,
+        pool: &[u8],
     ) -> Vec<tycho_substreams::prelude::Attribute> {
-        let component_id = format!("0x{pool}");
+        let component_id = pool.to_hex();
         changes
             .changes
             .iter()
@@ -216,7 +209,7 @@ mod tests {
     }
 
     fn initialize_event(
-        pool_address: String,
+        pool_address: Vec<u8>,
         ordinal: u64,
         sqrt_price: u64,
         tick: i32,
@@ -226,33 +219,33 @@ mod tests {
             log_ordinal: ordinal,
             transaction: Some(tx(ordinal)),
             r#type: Some(Type::Initialize(pool_event::Initialize {
-                sqrt_price: sqrt_price.to_string(),
+                sqrt_price: amount(sqrt_price),
                 tick,
             })),
             ..Default::default()
         }
     }
 
-    fn swap_event(pool_address: String, ordinal: u64, sqrt_price: u64, tick: i32) -> PoolEvent {
+    fn swap_event(pool_address: Vec<u8>, ordinal: u64, sqrt_price: u64, tick: i32) -> PoolEvent {
         PoolEvent {
             pool_address,
             log_ordinal: ordinal,
             transaction: Some(tx(ordinal)),
             r#type: Some(Type::Swap(pool_event::Swap {
-                sqrt_price: sqrt_price.to_string(),
+                sqrt_price: amount(sqrt_price),
                 tick,
-                liquidity: "0".to_string(),
-                amount_0: "0".to_string(),
-                amount_1: "0".to_string(),
-                sender: String::new(),
-                recipient: String::new(),
+                liquidity: amount(0),
+                amount_0: amount(0),
+                amount_1: amount(0),
+                sender: Vec::new(),
+                recipient: Vec::new(),
             })),
             ..Default::default()
         }
     }
 
     fn set_fee_protocol_event(
-        pool_address: String,
+        pool_address: Vec<u8>,
         ordinal: u64,
         token0_fee: u64,
         token1_fee: u64,
@@ -274,7 +267,11 @@ mod tests {
         Transaction { index, hash: vec![index as u8; 32], ..Default::default() }
     }
 
-    fn pool_address(seed: u8) -> String {
-        hex::encode(vec![seed; 20])
+    fn amount(value: u64) -> Vec<u8> {
+        BigInt::from(value).to_signed_bytes_be()
+    }
+
+    fn pool_address(seed: u8) -> Vec<u8> {
+        vec![seed; 20]
     }
 }
