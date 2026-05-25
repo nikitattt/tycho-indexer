@@ -3,7 +3,7 @@ use crate::pb::uniswap::v3::{
     Events,
 };
 use itertools::Itertools;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use substreams::scalar::BigInt;
 use substreams_helper::hex::Hexable;
 use tycho_substreams::prelude::*;
@@ -17,7 +17,7 @@ pub fn map_pool_event_attribute_changes(
 
 fn collect_pool_event_attribute_changes(events: Events) -> BlockEntityChanges {
     let mut pool_events = events.pool_events;
-    let mut transaction_changes: HashMap<u64, TransactionChangesBuilder> = HashMap::new();
+    let mut transaction_changes: FxHashMap<u64, TransactionChangesBuilder> = FxHashMap::default();
 
     pool_events.sort_unstable_by_key(|event| event.log_ordinal);
     for event in pool_events {
@@ -42,7 +42,7 @@ fn collect_pool_event_attribute_changes(events: Events) -> BlockEntityChanges {
 
 fn add_event_attribute_changes(
     event: PoolEvent,
-    transaction_changes: &mut HashMap<u64, TransactionChangesBuilder>,
+    transaction_changes: &mut FxHashMap<u64, TransactionChangesBuilder>,
 ) {
     let Some(event_type) = event.r#type.as_ref() else {
         return;
@@ -56,25 +56,22 @@ fn add_event_attribute_changes(
                 .unwrap()
                 .into();
 
-            add_pool_attribute(
+            add_pool_attributes(
                 transaction_changes,
                 &tx,
                 &event.pool_address,
-                Attribute {
-                    name: "sqrt_price_x96".to_string(),
-                    value: initialize.sqrt_price.clone(),
-                    change: ChangeType::Update.into(),
-                },
-            );
-            add_pool_attribute(
-                transaction_changes,
-                &tx,
-                &event.pool_address,
-                Attribute {
-                    name: "tick".to_string(),
-                    value: BigInt::from(initialize.tick).to_signed_bytes_be(),
-                    change: ChangeType::Update.into(),
-                },
+                vec![
+                    Attribute {
+                        name: "sqrt_price_x96".to_string(),
+                        value: initialize.sqrt_price.clone(),
+                        change: ChangeType::Update.into(),
+                    },
+                    Attribute {
+                        name: "tick".to_string(),
+                        value: BigInt::from(initialize.tick).to_signed_bytes_be(),
+                        change: ChangeType::Update.into(),
+                    },
+                ],
             );
         }
         pool_event::Type::Swap(swap) => {
@@ -84,25 +81,22 @@ fn add_event_attribute_changes(
                 .unwrap()
                 .into();
 
-            add_pool_attribute(
+            add_pool_attributes(
                 transaction_changes,
                 &tx,
                 &event.pool_address,
-                Attribute {
-                    name: "sqrt_price_x96".to_string(),
-                    value: swap.sqrt_price.clone(),
-                    change: ChangeType::Update.into(),
-                },
-            );
-            add_pool_attribute(
-                transaction_changes,
-                &tx,
-                &event.pool_address,
-                Attribute {
-                    name: "tick".to_string(),
-                    value: BigInt::from(swap.tick).to_signed_bytes_be(),
-                    change: ChangeType::Update.into(),
-                },
+                vec![
+                    Attribute {
+                        name: "sqrt_price_x96".to_string(),
+                        value: swap.sqrt_price.clone(),
+                        change: ChangeType::Update.into(),
+                    },
+                    Attribute {
+                        name: "tick".to_string(),
+                        value: BigInt::from(swap.tick).to_signed_bytes_be(),
+                        change: ChangeType::Update.into(),
+                    },
+                ],
             );
         }
         pool_event::Type::SetFeeProtocol(sfp) => {
@@ -112,45 +106,39 @@ fn add_event_attribute_changes(
                 .unwrap()
                 .into();
 
-            add_pool_attribute(
+            add_pool_attributes(
                 transaction_changes,
                 &tx,
                 &event.pool_address,
-                Attribute {
-                    name: "fee_protocol/token0".to_string(),
-                    value: BigInt::from(sfp.fee_protocol_0_new).to_signed_bytes_be(),
-                    change: ChangeType::Update.into(),
-                },
-            );
-            add_pool_attribute(
-                transaction_changes,
-                &tx,
-                &event.pool_address,
-                Attribute {
-                    name: "fee_protocol/token1".to_string(),
-                    value: BigInt::from(sfp.fee_protocol_1_new).to_signed_bytes_be(),
-                    change: ChangeType::Update.into(),
-                },
+                vec![
+                    Attribute {
+                        name: "fee_protocol/token0".to_string(),
+                        value: BigInt::from(sfp.fee_protocol_0_new).to_signed_bytes_be(),
+                        change: ChangeType::Update.into(),
+                    },
+                    Attribute {
+                        name: "fee_protocol/token1".to_string(),
+                        value: BigInt::from(sfp.fee_protocol_1_new).to_signed_bytes_be(),
+                        change: ChangeType::Update.into(),
+                    },
+                ],
             );
         }
         _ => {}
     }
 }
 
-fn add_pool_attribute(
-    transaction_changes: &mut HashMap<u64, TransactionChangesBuilder>,
+fn add_pool_attributes(
+    transaction_changes: &mut FxHashMap<u64, TransactionChangesBuilder>,
     tx: &Transaction,
     pool_address: &[u8],
-    attribute: Attribute,
+    attributes: Vec<Attribute>,
 ) {
     let builder = transaction_changes
         .entry(tx.index)
         .or_insert_with(|| TransactionChangesBuilder::new(tx));
 
-    builder.add_entity_change(&EntityChanges {
-        component_id: pool_address.to_hex(),
-        attributes: vec![attribute],
-    });
+    builder.add_entity_change(&EntityChanges { component_id: pool_address.to_hex(), attributes });
 }
 
 #[cfg(test)]
@@ -182,6 +170,24 @@ mod tests {
         assert_eq!(attr_value(&attrs, "tick"), BigInt::from(8));
         assert_eq!(attr_value(&attrs, "fee_protocol/token0"), BigInt::from(3));
         assert_eq!(attr_value(&attrs, "fee_protocol/token1"), BigInt::from(4));
+    }
+
+    #[test]
+    fn applies_event_attributes_in_log_ordinal_order() {
+        let pool = pool_address(1);
+        let events = Events {
+            pool_events: vec![
+                swap_event(pool.clone(), 12, 789, 9),
+                initialize_event(pool.clone(), 10, 123, -7),
+                swap_event(pool.clone(), 11, 456, 8),
+            ],
+        };
+
+        let changes = collect_pool_event_attribute_changes(events);
+        let attrs = attributes_for_pool(&changes, &pool);
+
+        assert_eq!(attr_value(&attrs, "sqrt_price_x96"), BigInt::from(789));
+        assert_eq!(attr_value(&attrs, "tick"), BigInt::from(9));
     }
 
     fn attributes_for_pool(

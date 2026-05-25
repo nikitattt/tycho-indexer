@@ -1,5 +1,5 @@
-use std::collections::{hash_map::Entry, HashMap};
-
+use rustc_hash::FxHashMap;
+use std::collections::hash_map::Entry;
 use substreams::store::{
     StoreGet, StoreGetInt64, StoreSet, StoreSetInt64, StoreSetSum, StoreSetSumBigInt,
 };
@@ -113,14 +113,18 @@ where
     F: FnMut(u64, &[u8]) -> Option<i64>,
 {
     let mut pool_events = events.pool_events;
-    let mut current_ticks = HashMap::new();
+    let mut current_ticks = FxHashMap::default();
     let mut changes = Vec::new();
 
     pool_events.sort_unstable_by_key(|event| event.log_ordinal);
 
     for event in pool_events {
+        let pool_key = address_key(&event.pool_address);
+
         if let Some(tick) = event_current_tick(&event) {
-            current_ticks.insert(event.pool_address.clone(), tick);
+            if let Some(pool_key) = pool_key {
+                current_ticks.insert(pool_key, tick);
+            }
         }
 
         match event.r#type.as_ref().unwrap() {
@@ -130,12 +134,14 @@ where
                 }
             }
             pool_event::Type::Mint(_) | pool_event::Type::Burn(_) => {
-                let pool = event.pool_address.clone();
-                let current_tick = match current_ticks.entry(pool.clone()) {
-                    Entry::Occupied(entry) => *entry.get(),
-                    Entry::Vacant(entry) => {
-                        *entry.insert(current_tick_at(event.log_ordinal, &pool).unwrap_or(0))
-                    }
+                let current_tick = match pool_key {
+                    Some(pool_key) => match current_ticks.entry(pool_key) {
+                        Entry::Occupied(entry) => *entry.get(),
+                        Entry::Vacant(entry) => *entry.insert(
+                            current_tick_at(event.log_ordinal, &event.pool_address).unwrap_or(0),
+                        ),
+                    },
+                    None => current_tick_at(event.log_ordinal, &event.pool_address).unwrap_or(0),
                 };
 
                 if let Some(change) = event_to_liquidity_deltas(current_tick, event) {
@@ -148,6 +154,16 @@ where
 
     changes.sort_unstable_by_key(|change| change.ordinal);
     LiquidityChanges { changes }
+}
+
+fn address_key(address: &[u8]) -> Option<[u8; 20]> {
+    if address.len() != 20 {
+        return None;
+    }
+
+    let mut key = [0u8; 20];
+    key.copy_from_slice(address);
+    Some(key)
 }
 
 fn event_current_tick(event: &PoolEvent) -> Option<i64> {
@@ -202,6 +218,29 @@ mod tests {
 
         assert_eq!(tick_reads, 0);
         assert_eq!(changes.changes.len(), 2);
+        assert_eq!(changes.changes[1].change_type(), LiquidityChangeType::Delta);
+    }
+
+    #[test]
+    fn liquidity_uses_ordinal_order_for_current_tick_cache() {
+        let pool = pool_address(1);
+        let events = Events {
+            pool_events: vec![
+                mint_event(pool.clone(), 11, 0, 10, 25),
+                swap_event(pool.clone(), 10, 5, 100),
+            ],
+        };
+        let mut tick_reads = 0;
+
+        let changes = liquidity_changes_from_events(events, |_, _| {
+            tick_reads += 1;
+            Some(-5)
+        });
+
+        assert_eq!(tick_reads, 0);
+        assert_eq!(changes.changes.len(), 2);
+        assert_eq!(changes.changes[0].ordinal, 10);
+        assert_eq!(changes.changes[1].ordinal, 11);
         assert_eq!(changes.changes[1].change_type(), LiquidityChangeType::Delta);
     }
 

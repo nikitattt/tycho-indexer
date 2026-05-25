@@ -12,7 +12,8 @@ use crate::{
     },
 };
 use anyhow::Ok;
-use std::collections::{hash_map::Entry, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::hash_map::Entry;
 use substreams::store::{StoreGet, StoreGetProto};
 use substreams_ethereum::pb::eth::v2::{self as eth, Log, TransactionTrace};
 
@@ -50,7 +51,7 @@ pub fn map_events(
 
 #[derive(Default)]
 struct PoolLookupCache {
-    pools: HashMap<Vec<u8>, Option<Pool>>,
+    pools: FxHashMap<[u8; 20], Option<Pool>>,
 }
 
 impl PoolLookupCache {
@@ -58,13 +59,27 @@ impl PoolLookupCache {
     where
         F: FnMut(&[u8]) -> Option<Pool>,
     {
-        match self.pools.entry(address.to_vec()) {
+        let Some(key) = address_key(address) else {
+            return None;
+        };
+
+        match self.pools.entry(key) {
             Entry::Occupied(entry) => entry.into_mut().as_ref(),
             Entry::Vacant(entry) => entry
                 .insert(lookup_pool(address))
                 .as_ref(),
         }
     }
+}
+
+fn address_key(address: &[u8]) -> Option<[u8; 20]> {
+    if address.len() != 20 {
+        return None;
+    }
+
+    let mut key = [0u8; 20];
+    key.copy_from_slice(address);
+    Some(key)
 }
 
 fn event_from_known_pool_log<F>(

@@ -1,6 +1,7 @@
 use crate::pb::uniswap::v3::{LiquidityChanges, TickDeltas};
 use itertools::Itertools;
-use std::{collections::HashMap, str::FromStr};
+use rustc_hash::FxHashMap;
+use std::str::{self, FromStr};
 use substreams::{pb::substreams::StoreDeltas, scalar::BigInt};
 use substreams_ethereum::pb::eth::v2::{self as eth};
 use substreams_helper::hex::Hexable;
@@ -21,7 +22,7 @@ pub fn map_protocol_changes(
 ) -> Result<BlockChanges, substreams::errors::Error> {
     // We merge contract changes by transaction (identified by transaction index) making it easy to
     //  sort them at the very end.
-    let mut transaction_changes: HashMap<_, TransactionChangesBuilder> = HashMap::new();
+    let mut transaction_changes: FxHashMap<u64, TransactionChangesBuilder> = FxHashMap::default();
 
     // Add created pools to the tx_changes_map
     for change in created_pools.changes.into_iter() {
@@ -77,14 +78,11 @@ pub fn map_protocol_changes(
         .into_iter()
         .zip(ticks_map_deltas.deltas)
         .for_each(|(store_delta, tick_delta)| {
-            let new_value_bigint =
-                BigInt::from_str(&String::from_utf8(store_delta.new_value).unwrap()).unwrap();
+            let new_value_bigint = bigint_from_store_value(&store_delta.new_value);
 
             // If old value is empty or the int value is 0, it's considered as a creation.
             let is_creation = store_delta.old_value.is_empty()
-                || BigInt::from_str(&String::from_utf8(store_delta.old_value).unwrap())
-                    .unwrap()
-                    .is_zero();
+                || bigint_from_store_value(&store_delta.old_value).is_zero();
             let attribute_name = format!("ticks/{}/net-liquidity", tick_delta.tick_index);
             let attribute = Attribute {
                 name: attribute_name,
@@ -114,14 +112,7 @@ pub fn map_protocol_changes(
         .into_iter()
         .zip(pool_liquidity_changes.changes)
         .for_each(|(store_delta, change)| {
-            let new_value_bigint = BigInt::from_str(
-                String::from_utf8(store_delta.new_value)
-                    .unwrap()
-                    .split(':')
-                    .nth(1)
-                    .unwrap(),
-            )
-            .unwrap();
+            let new_value_bigint = liquidity_bigint_from_store_value(&store_delta.new_value);
             let tx = change.transaction.unwrap();
             let builder = transaction_changes
                 .entry(tx.index)
@@ -150,7 +141,7 @@ pub fn map_protocol_changes(
 
 fn add_pool_attribute_changes(
     pool_attribute_changes: BlockEntityChanges,
-    transaction_changes: &mut HashMap<u64, TransactionChangesBuilder>,
+    transaction_changes: &mut FxHashMap<u64, TransactionChangesBuilder>,
 ) {
     for change in pool_attribute_changes.changes {
         let tx = change.tx.as_ref().unwrap();
@@ -163,5 +154,31 @@ fn add_pool_attribute_changes(
             .for_each(|ec| {
                 builder.add_entity_change(ec);
             });
+    }
+}
+
+fn bigint_from_store_value(value: &[u8]) -> BigInt {
+    BigInt::from_str(str::from_utf8(value).unwrap()).unwrap()
+}
+
+fn liquidity_bigint_from_store_value(value: &[u8]) -> BigInt {
+    BigInt::from_str(
+        str::from_utf8(value)
+            .unwrap()
+            .split(':')
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_store_delta_bigints_without_string_allocation() {
+        assert_eq!(bigint_from_store_value(b"-17"), BigInt::from(-17));
+        assert_eq!(liquidity_bigint_from_store_value(b"set:12345"), BigInt::from(12_345));
     }
 }
