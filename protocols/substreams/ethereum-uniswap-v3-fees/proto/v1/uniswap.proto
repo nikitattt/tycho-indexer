@@ -57,6 +57,32 @@ message LiquidityChanges {
     repeated LiquidityChange changes = 1;
 }
 
+message BlockPoolData {
+  BlockMetadata block = 1;
+  Events events = 2;
+  repeated ProtocolFeeChange protocol_fee_changes = 3;
+}
+
+message BlockMetadata {
+  bytes hash = 1;
+  bytes parent_hash = 2;
+  uint64 number = 3;
+  uint64 timestamp = 4;
+}
+
+message ProtocolFeeChange {
+  bytes pool_address = 1;
+  ProtocolFeeToken token = 2;
+  bytes value = 3;
+  uint64 ordinal = 4;
+  Transaction transaction = 5;
+}
+
+enum ProtocolFeeToken {
+  TOKEN0 = 0;
+  TOKEN1 = 1;
+}
+
 
 enum LiquidityChangeType {
   DELTA = 0;

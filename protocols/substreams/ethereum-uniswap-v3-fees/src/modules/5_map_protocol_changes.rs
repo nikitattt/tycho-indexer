@@ -1,15 +1,14 @@
-use crate::pb::uniswap::v3::{LiquidityChanges, TickDeltas};
+use crate::pb::uniswap::v3::{BlockMetadata, BlockPoolData, LiquidityChanges, TickDeltas};
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use std::str::{self, FromStr};
 use substreams::{pb::substreams::StoreDeltas, scalar::BigInt};
-use substreams_ethereum::pb::eth::v2::{self as eth};
 use substreams_helper::hex::Hexable;
 use tycho_substreams::{balances::aggregate_balances_changes, prelude::*};
 
 #[substreams::handlers::map]
 pub fn map_protocol_changes(
-    block: eth::Block,
+    pool_data: BlockPoolData,
     created_pools: BlockEntityChanges,
     pool_event_attribute_changes: BlockEntityChanges,
     pool_protocol_fee_changes: BlockEntityChanges,
@@ -129,7 +128,7 @@ pub fn map_protocol_changes(
         });
 
     Ok(BlockChanges {
-        block: Some((&block).into()),
+        block: pool_data.block.map(block_from_metadata),
         changes: transaction_changes
             .drain()
             .sorted_unstable_by_key(|(index, _)| *index)
@@ -154,6 +153,15 @@ fn add_pool_attribute_changes(
             .for_each(|ec| {
                 builder.add_entity_change(ec);
             });
+    }
+}
+
+fn block_from_metadata(block: BlockMetadata) -> Block {
+    Block {
+        hash: block.hash,
+        parent_hash: block.parent_hash,
+        number: block.number,
+        ts: block.timestamp,
     }
 }
 

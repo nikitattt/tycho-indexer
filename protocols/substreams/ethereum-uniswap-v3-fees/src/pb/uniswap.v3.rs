@@ -82,6 +82,42 @@ pub struct LiquidityChanges {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BlockPoolData {
+    #[prost(message, optional, tag = "1")]
+    pub block: ::core::option::Option<BlockMetadata>,
+    #[prost(message, optional, tag = "2")]
+    pub events: ::core::option::Option<Events>,
+    #[prost(message, repeated, tag = "3")]
+    pub protocol_fee_changes: ::prost::alloc::vec::Vec<ProtocolFeeChange>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BlockMetadata {
+    #[prost(bytes = "vec", tag = "1")]
+    pub hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub parent_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub number: u64,
+    #[prost(uint64, tag = "4")]
+    pub timestamp: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProtocolFeeChange {
+    #[prost(bytes = "vec", tag = "1")]
+    pub pool_address: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "ProtocolFeeToken", tag = "2")]
+    pub token: i32,
+    #[prost(bytes = "vec", tag = "3")]
+    pub value: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    pub ordinal: u64,
+    #[prost(message, optional, tag = "5")]
+    pub transaction: ::core::option::Option<Transaction>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Events {
     #[prost(message, repeated, tag = "3")]
     pub pool_events: ::prost::alloc::vec::Vec<events::PoolEvent>,
@@ -266,6 +302,32 @@ pub mod events {
             SetFeeProtocol(SetFeeProtocol),
             #[prost(message, tag = "8")]
             CollectProtocol(CollectProtocol),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ProtocolFeeToken {
+    Token0 = 0,
+    Token1 = 1,
+}
+impl ProtocolFeeToken {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            ProtocolFeeToken::Token0 => "TOKEN0",
+            ProtocolFeeToken::Token1 => "TOKEN1",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TOKEN0" => Some(Self::Token0),
+            "TOKEN1" => Some(Self::Token1),
+            _ => None,
         }
     }
 }
