@@ -1,10 +1,9 @@
 use crate::{
     modules::{
-        map_events::{address_key, event_from_known_pool_log, PoolLookupCache},
+        map_events::{address_key, classify_v3_pool_event_log, log_to_event, PoolLookupCache},
         pool_key,
     },
     pb::uniswap::v3::{
-        events::{pool_event, PoolEvent},
         BlockMetadata, BlockPoolData, Events, Pool, ProtocolFeeChange, ProtocolFeeToken,
     },
     storage::{
@@ -12,6 +11,7 @@ use crate::{
         PROTOCOL_FEE_TOKEN1_OFFSET,
     },
 };
+use arrayvec::ArrayVec;
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
@@ -40,6 +40,8 @@ where
     let block_number = block.number;
     let block_metadata = block_metadata(&block);
     let mut pool_events = Vec::new();
+    let mut last_pool_event_ordinal = None;
+    let mut pool_events_are_sorted = true;
     let mut pool_cache = PoolLookupCache::default();
     let mut protocol_fee_changes = FxHashMap::default();
 
@@ -55,16 +57,27 @@ where
             .expect("all transaction traces have a receipt");
 
         for log in &receipt.logs {
-            if let Some(event) =
-                event_from_known_pool_log(log, &tx, &mut pool_cache, &mut lookup_pool)
-            {
-                if can_change_protocol_fees(&event) {
-                    if let Some(pool) = address_key(&event.pool_address) {
-                        fee_candidate_pools.insert(pool);
-                    }
+            let Some(event_kind) = classify_v3_pool_event_log(log) else {
+                continue;
+            };
+            let Some(pool) = pool_cache.get_or_lookup(&log.address, &mut lookup_pool) else {
+                continue;
+            };
+            let Some(event) = log_to_event(log, event_kind, pool, &tx) else {
+                continue;
+            };
+
+            if event_kind.can_change_protocol_fees() {
+                if let Some(pool) = address_key(&event.pool_address) {
+                    fee_candidate_pools.insert(pool);
                 }
-                pool_events.push(event);
             }
+
+            if let Some(last_ordinal) = last_pool_event_ordinal {
+                pool_events_are_sorted &= last_ordinal <= event.log_ordinal;
+            }
+            last_pool_event_ordinal = Some(event.log_ordinal);
+            pool_events.push(event);
         }
 
         if block_number >= BASE_PROTOCOL_FEES_INITIAL_BLOCK && !fee_candidate_pools.is_empty() {
@@ -72,7 +85,9 @@ where
         }
     }
 
-    pool_events.sort_unstable_by_key(|e| e.log_ordinal);
+    if !pool_events_are_sorted {
+        pool_events.sort_unstable_by_key(|e| e.log_ordinal);
+    }
 
     Ok(BlockPoolData {
         block: Some(block_metadata),
@@ -104,13 +119,13 @@ fn block_metadata(block: &eth::Block) -> BlockMetadata {
 }
 
 enum CandidatePools {
-    Small(Vec<[u8; 20]>),
+    Small(ArrayVec<[u8; 20], INLINE_POOL_LIMIT>),
     Large(FxHashSet<[u8; 20]>),
 }
 
 impl Default for CandidatePools {
     fn default() -> Self {
-        Self::Small(Vec::new())
+        Self::Small(ArrayVec::new())
     }
 }
 
@@ -162,15 +177,6 @@ impl CandidatePools {
     }
 }
 
-fn can_change_protocol_fees(event: &PoolEvent) -> bool {
-    matches!(
-        event.r#type.as_ref(),
-        Some(pool_event::Type::Swap(_))
-            | Some(pool_event::Type::Flash(_))
-            | Some(pool_event::Type::CollectProtocol(_))
-    )
-}
-
 fn add_tx_protocol_fee_changes(
     tx: &TransactionTrace,
     event_pools: &CandidatePools,
@@ -179,18 +185,26 @@ fn add_tx_protocol_fee_changes(
     let mut tycho_tx = None;
 
     for call in &tx.calls {
-        if call.state_reverted {
+        if call.state_reverted || call.storage_changes.is_empty() {
             continue;
         }
 
-        let Some(call_pool) = event_pools.get(&call.address) else {
-            continue;
-        };
+        let mut call_pool = None;
+        let mut call_pool_checked = false;
 
         for storage_change in &call.storage_changes {
-            if storage_change.key != PROTOCOL_FEES_SLOT {
+            if storage_change.key.as_slice() != PROTOCOL_FEES_SLOT.as_slice() {
                 continue;
             }
+
+            if !call_pool_checked {
+                call_pool = event_pools.get(&call.address);
+                call_pool_checked = true;
+            }
+
+            let Some(call_pool) = call_pool else {
+                break;
+            };
 
             let pool = if storage_change.address.as_slice() == call.address.as_slice() {
                 call_pool
@@ -474,6 +488,23 @@ mod tests {
         assert_eq!(protocol_fee_value(&data, &pool1, ProtocolFeeToken::Token1), BigInt::from(4));
         assert_eq!(protocol_fee_value(&data, &pool2, ProtocolFeeToken::Token0), BigInt::from(7));
         assert_eq!(protocol_fee_value(&data, &pool2, ProtocolFeeToken::Token1), BigInt::from(8));
+    }
+
+    #[test]
+    fn preserves_ordinal_event_order_when_block_logs_are_out_of_order() {
+        let pool = pool_address(1);
+        let data = collect_with_pools(
+            block_with_transactions(vec![tx_with_logs_and_calls(
+                1,
+                vec![swap_log(pool.clone(), 20), swap_log(pool.clone(), 10)],
+                Vec::new(),
+            )]),
+            &[pool],
+        );
+
+        let events = data.events.unwrap();
+        assert_eq!(events.pool_events[0].log_ordinal, 10);
+        assert_eq!(events.pool_events[1].log_ordinal, 20);
     }
 
     #[test]

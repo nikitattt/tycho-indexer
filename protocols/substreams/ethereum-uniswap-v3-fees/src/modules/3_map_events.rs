@@ -10,9 +10,27 @@ use crate::{
         BlockPoolData, Events, Pool,
     },
 };
+use hex_literal::hex;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use substreams_ethereum::pb::eth::v2::{Log, TransactionTrace};
+
+const BURN_TOPIC: [u8; 32] =
+    hex!("0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c");
+const COLLECT_TOPIC: [u8; 32] =
+    hex!("70935338e69775456a85ddef226c395fb668b63fa0115f5f20610b388e6ca9c0");
+const COLLECT_PROTOCOL_TOPIC: [u8; 32] =
+    hex!("596b573906218d3411850b26a6b437d6c4522fdb43d2d2386263f86d50b8b151");
+const FLASH_TOPIC: [u8; 32] =
+    hex!("bddb71d17860376ba52b25a5028beea23581364a40522f6bcfb86bb1f2dca633");
+const INITIALIZE_TOPIC: [u8; 32] =
+    hex!("98636036cb66a9c19a37435efc1e90142190214e8abeb821bdba3f2990dd4c95");
+const MINT_TOPIC: [u8; 32] =
+    hex!("7a53080ba414158be7ec69b987b5fb7d07dee101fe85548f0853ae16239d0bde");
+const SET_FEE_PROTOCOL_TOPIC: [u8; 32] =
+    hex!("973d8d92bb299f4af6ce49b52a8adb85ae46b9f214c4c4fc06ac77401237b133");
+const SWAP_TOPIC: [u8; 32] =
+    hex!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
 #[substreams::handlers::map]
 pub fn map_events(pool_data: BlockPoolData) -> Result<Events, anyhow::Error> {
@@ -25,7 +43,7 @@ pub(super) struct PoolLookupCache {
 }
 
 impl PoolLookupCache {
-    fn get_or_lookup<F>(&mut self, address: &[u8], mut lookup_pool: F) -> Option<&Pool>
+    pub(super) fn get_or_lookup<F>(&mut self, address: &[u8], mut lookup_pool: F) -> Option<&Pool>
     where
         F: FnMut(&[u8]) -> Option<Pool>,
     {
@@ -52,6 +70,7 @@ pub(super) fn address_key(address: &[u8]) -> Option<[u8; 20]> {
     Some(key)
 }
 
+#[cfg(test)]
 pub(super) fn event_from_known_pool_log<F>(
     log: &Log,
     tx: &TransactionTrace,
@@ -67,8 +86,8 @@ where
     log_to_event(log, event_kind, pool, tx)
 }
 
-#[derive(Clone, Copy)]
-enum EventKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EventKind {
     Initialize,
     Swap,
     Flash,
@@ -79,29 +98,29 @@ enum EventKind {
     CollectProtocol,
 }
 
-fn classify_v3_pool_event_log(log: &Log) -> Option<EventKind> {
-    if Initialize::match_log(log) {
-        Some(EventKind::Initialize)
-    } else if Swap::match_log(log) {
-        Some(EventKind::Swap)
-    } else if Flash::match_log(log) {
-        Some(EventKind::Flash)
-    } else if Mint::match_log(log) {
-        Some(EventKind::Mint)
-    } else if Burn::match_log(log) {
-        Some(EventKind::Burn)
-    } else if Collect::match_log(log) {
-        Some(EventKind::Collect)
-    } else if SetFeeProtocol::match_log(log) {
-        Some(EventKind::SetFeeProtocol)
-    } else if CollectProtocol::match_log(log) {
-        Some(EventKind::CollectProtocol)
-    } else {
-        None
+impl EventKind {
+    pub(super) fn can_change_protocol_fees(self) -> bool {
+        matches!(self, Self::Swap | Self::Flash | Self::CollectProtocol)
     }
 }
 
-fn log_to_event(
+pub(super) fn classify_v3_pool_event_log(log: &Log) -> Option<EventKind> {
+    let topic0 = log.topics.first()?.as_slice();
+
+    match (log.topics.len(), log.data.len()) {
+        (1, 64) if topic0 == INITIALIZE_TOPIC.as_slice() => Some(EventKind::Initialize),
+        (1, 128) if topic0 == SET_FEE_PROTOCOL_TOPIC.as_slice() => Some(EventKind::SetFeeProtocol),
+        (3, 64) if topic0 == COLLECT_PROTOCOL_TOPIC.as_slice() => Some(EventKind::CollectProtocol),
+        (3, 128) if topic0 == FLASH_TOPIC.as_slice() => Some(EventKind::Flash),
+        (3, 160) if topic0 == SWAP_TOPIC.as_slice() => Some(EventKind::Swap),
+        (4, 96) if topic0 == BURN_TOPIC.as_slice() => Some(EventKind::Burn),
+        (4, 96) if topic0 == COLLECT_TOPIC.as_slice() => Some(EventKind::Collect),
+        (4, 128) if topic0 == MINT_TOPIC.as_slice() => Some(EventKind::Mint),
+        _ => None,
+    }
+}
+
+pub(super) fn log_to_event(
     event: &Log,
     event_kind: EventKind,
     pool: &Pool,
@@ -250,8 +269,6 @@ mod tests {
     use hex_literal::hex;
     use substreams::scalar::BigInt;
 
-    const SWAP_TOPIC: [u8; 32] =
-        hex!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
     const TRANSFER_TOPIC: [u8; 32] =
         hex!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
 
@@ -314,7 +331,23 @@ mod tests {
 
     #[test]
     fn recognizes_only_supported_v3_pool_event_shapes() {
-        assert!(classify_v3_pool_event_log(&swap_log(pool_address(1), 1)).is_some());
+        let cases = [
+            (INITIALIZE_TOPIC, 1, 64, EventKind::Initialize),
+            (SET_FEE_PROTOCOL_TOPIC, 1, 128, EventKind::SetFeeProtocol),
+            (COLLECT_PROTOCOL_TOPIC, 3, 64, EventKind::CollectProtocol),
+            (FLASH_TOPIC, 3, 128, EventKind::Flash),
+            (SWAP_TOPIC, 3, 160, EventKind::Swap),
+            (BURN_TOPIC, 4, 96, EventKind::Burn),
+            (COLLECT_TOPIC, 4, 96, EventKind::Collect),
+            (MINT_TOPIC, 4, 128, EventKind::Mint),
+        ];
+
+        for (topic, topic_count, data_len, event_kind) in cases {
+            assert_eq!(
+                classify_v3_pool_event_log(&event_log(topic, topic_count, data_len)),
+                Some(event_kind)
+            );
+        }
 
         let malformed_swap = Log {
             address: pool_address(1),
@@ -324,6 +357,18 @@ mod tests {
             ..Default::default()
         };
         assert!(classify_v3_pool_event_log(&malformed_swap).is_none());
+    }
+
+    #[test]
+    fn distinguishes_events_that_share_topic_and_data_lengths() {
+        assert_eq!(
+            classify_v3_pool_event_log(&event_log(BURN_TOPIC, 4, 96)),
+            Some(EventKind::Burn)
+        );
+        assert_eq!(
+            classify_v3_pool_event_log(&event_log(COLLECT_TOPIC, 4, 96)),
+            Some(EventKind::Collect)
+        );
     }
 
     #[test]
@@ -351,6 +396,20 @@ mod tests {
             topics: vec![SWAP_TOPIC.to_vec(), address_topic(2), address_topic(3)],
             data: vec![0; 160],
             ordinal,
+            ..Default::default()
+        }
+    }
+
+    fn event_log(topic: [u8; 32], topic_count: usize, data_len: usize) -> Log {
+        let mut topics = Vec::with_capacity(topic_count);
+        topics.push(topic.to_vec());
+        topics.resize(topic_count, vec![0; 32]);
+
+        Log {
+            address: pool_address(1),
+            topics,
+            data: vec![0; data_len],
+            ordinal: 1,
             ..Default::default()
         }
     }
