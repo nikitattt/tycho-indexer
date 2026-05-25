@@ -3,7 +3,7 @@ use std::str;
 use substreams::store::{StoreNew, StoreSetIfNotExists, StoreSetIfNotExistsProto};
 use tycho_substreams::models::BlockEntityChanges;
 
-use crate::pb::uniswap::v3::Pool;
+use crate::{modules::pool_key, pb::uniswap::v3::Pool};
 
 #[substreams::handlers::store]
 pub fn store_pools(pools_created: BlockEntityChanges, store: StoreSetIfNotExistsProto<Pool>) {
@@ -18,7 +18,7 @@ pub fn store_pools(pools_created: BlockEntityChanges, store: StoreSetIfNotExists
                 token1: component_change.tokens[1].clone(),
                 created_tx_hash: change.tx.as_ref().unwrap().hash.clone(),
             };
-            store.set_if_not_exists(0, format!("{}:{}", "Pool", pool_address), &pool);
+            store.set_if_not_exists(0, pool_key(&pool.address), &pool);
         }
     }
 }
