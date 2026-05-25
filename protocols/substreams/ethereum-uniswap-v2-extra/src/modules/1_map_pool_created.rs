@@ -268,7 +268,14 @@ mod tests {
         let token1 = address(3);
         let pair = address(4);
         let log = pair_created_log(address(1), token0.clone(), token1.clone(), pair.clone());
+        let mut expected_topic = [0u8; 32];
+        let mut hasher = Keccak::v256();
+        hasher.update(b"PairCreated(address,address,address,uint256)");
+        hasher.finalize(&mut expected_topic);
 
+        assert_eq!(PAIR_CREATED_TOPIC, expected_topic);
+        assert_eq!(log.topics[0].as_slice(), expected_topic.as_slice());
+        assert!(crate::abi::factory::events::PairCreated::match_log(&log));
         let event = decode_pair_created(&log).unwrap();
 
         assert_eq!(event, PairCreatedData { token0, token1, pair });

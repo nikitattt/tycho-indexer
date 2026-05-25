@@ -294,6 +294,7 @@ mod tests {
     use super::*;
     use crate::storage::{K_LAST_ATTRIBUTE, K_LAST_SLOT, TOTAL_SUPPLY_SLOT};
     use substreams::scalar::BigInt;
+    use tiny_keccak::Hasher;
 
     const TRANSFER_TOPIC: [u8; 32] =
         hex!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
@@ -326,12 +327,21 @@ mod tests {
     #[test]
     fn caches_pool_lookup_hits_and_keeps_latest_sync_per_transaction() {
         let pool = address(1);
+        let mut expected_topic = [0u8; 32];
+        let mut hasher = tiny_keccak::Keccak::v256();
+        hasher.update(b"Sync(uint112,uint112)");
+        hasher.finalize(&mut expected_topic);
+        let log = sync_log(pool.clone(), 1, 2, 10);
         let block = block_with_transactions(vec![transaction(
             0,
-            vec![sync_log(pool.clone(), 1, 2, 10), sync_log(pool.clone(), 3, 4, 11)],
+            vec![log.clone(), sync_log(pool.clone(), 3, 4, 11)],
             Vec::new(),
         )]);
         let mut lookups = 0;
+
+        assert_eq!(SYNC_TOPIC, expected_topic);
+        assert_eq!(log.topics[0].as_slice(), expected_topic.as_slice());
+        assert!(Sync::match_log(&log));
 
         let changes = collect_protocol_changes(&block, BlockChanges::default(), |address| {
             lookups += 1;
