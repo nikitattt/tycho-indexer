@@ -24,7 +24,7 @@ binaries:
 modules:
     - name: map_pool_data
       kind: map
-      initialBlock: 46344200
+      initialBlock: 46469195
       inputs:
           - source: sf.ethereum.type.v2.Block
       output:
@@ -32,7 +32,7 @@ modules:
 
     - name: map_events
       kind: map
-      initialBlock: 46344200
+      initialBlock: 46469195
       inputs:
           - map: map_pool_data
       output:
@@ -40,7 +40,7 @@ modules:
 
     - name: map_balance_changes
       kind: map
-      initialBlock: 46344200
+      initialBlock: 46469195
       inputs:
           - map: map_events
       output:
@@ -48,7 +48,7 @@ modules:
 
     - name: map_pool_event_attribute_changes
       kind: map
-      initialBlock: 46344200
+      initialBlock: 46469195
       inputs:
           - map: map_events
       output:
@@ -56,7 +56,7 @@ modules:
 
     - name: map_pool_protocol_fee_changes
       kind: map
-      initialBlock: 46344200
+      initialBlock: 46469195
       inputs:
           - map: map_pool_data
       output:
@@ -64,7 +64,7 @@ modules:
 
     - name: store_pools_balances
       kind: store
-      initialBlock: 46344200
+      initialBlock: 46469195
       updatePolicy: add
       valueType: bigint
       inputs:
@@ -72,7 +72,7 @@ modules:
 
     - name: map_ticks_changes
       kind: map
-      initialBlock: 46344200
+      initialBlock: 46469195
       inputs:
           - map: map_events
       output:
@@ -80,7 +80,7 @@ modules:
 
     - name: store_ticks_liquidity
       kind: store
-      initialBlock: 46344200
+      initialBlock: 46469195
       updatePolicy: add
       valueType: bigint
       inputs:
@@ -88,7 +88,7 @@ modules:
 
     - name: store_pool_current_tick
       kind: store
-      initialBlock: 46344200
+      initialBlock: 46469195
       updatePolicy: set
       valueType: int64
       inputs:
@@ -96,7 +96,7 @@ modules:
 
     - name: map_liquidity_changes
       kind: map
-      initialBlock: 46344200
+      initialBlock: 46469195
       inputs:
           - map: map_events
           - store: store_pool_current_tick
@@ -105,7 +105,7 @@ modules:
 
     - name: store_liquidity
       kind: store
-      initialBlock: 46344200
+      initialBlock: 46469195
       updatePolicy: set_sum
       valueType: bigint
       inputs:
@@ -113,7 +113,7 @@ modules:
 
     - name: map_protocol_changes
       kind: map
-      initialBlock: 46344200
+      initialBlock: 46469195
       inputs:
           - map: map_pool_data
           - map: map_pool_event_attribute_changes
