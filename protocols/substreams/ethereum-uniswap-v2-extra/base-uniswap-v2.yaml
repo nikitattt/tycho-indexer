@@ -39,6 +39,7 @@ modules:
       kind: map
       initialBlock: 10526492
       inputs:
+          - params: string
           - source: sf.ethereum.type.v2.Block
           - map: map_pools_created
           - store: store_pools
@@ -47,3 +48,4 @@ modules:
 
 params:
     map_pools_created: factory_address=8909Dc15e40173Ff4699343b6eB8132c65e18eC6&protocol_type_name=uniswap_v2_pool
+    map_protocol_changes: use_bloom_gate=true
