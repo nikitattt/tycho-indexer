@@ -1,7 +1,6 @@
 use arrayvec::ArrayVec;
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Deserialize;
 use std::collections::hash_map::Entry;
 use substreams::store::{StoreGet, StoreGetProto};
 use substreams_ethereum::pb::eth::v2::{self as eth};
@@ -25,38 +24,20 @@ const BLOOM_BYTES: usize = 256;
 const BLOOM_BITS: usize = 2048;
 const INLINE_POOL_LIMIT: usize = 4;
 
-#[derive(Debug, Deserialize, Default)]
-struct Params {
-    #[serde(default)]
-    use_bloom_gate: bool,
-}
-
 #[substreams::handlers::map]
 pub fn map_protocol_changes(
-    params: String,
     block: eth::Block,
     created_pools: BlockChanges,
     pools_store: StoreGetProto<ProtocolComponent>,
 ) -> Result<BlockChanges, substreams::errors::Error> {
-    let params = parse_params(&params);
-
-    Ok(collect_protocol_changes(&block, created_pools, &params, |address| {
+    Ok(collect_protocol_changes(&block, created_pools, |address| {
         pools_store.get_last(pool_store_key(address))
     }))
-}
-
-fn parse_params(params: &str) -> Params {
-    if params.trim().is_empty() {
-        return Params::default();
-    }
-
-    serde_qs::from_str(params).expect("Unable to deserialize params")
 }
 
 fn collect_protocol_changes<F>(
     block: &eth::Block,
     created_pools: BlockChanges,
-    params: &Params,
     mut lookup_pool: F,
 ) -> BlockChanges
 where
@@ -72,7 +53,7 @@ where
     let mut pool_cache = PoolLookupCache::default();
     let mut latest_extra_attributes = FxHashMap::default();
 
-    if !params.use_bloom_gate || block_bloom_may_contain_pair_events(block) {
+    if block_bloom_may_contain_pair_events(block) {
         for tx in block
             .transaction_traces
             .iter()
@@ -474,11 +455,10 @@ mod tests {
         )]);
         let mut lookups = 0;
 
-        let changes =
-            collect_protocol_changes(&block, BlockChanges::default(), &Params::default(), |_| {
-                lookups += 1;
-                None
-            });
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |_| {
+            lookups += 1;
+            None
+        });
 
         assert_eq!(lookups, 0);
         assert!(changes.changes.is_empty());
@@ -500,15 +480,10 @@ mod tests {
         assert_eq!(log.topics[0].as_slice(), expected_topic.as_slice());
         assert!(Sync::match_log(&log));
 
-        let changes = collect_protocol_changes(
-            &block,
-            BlockChanges::default(),
-            &Params::default(),
-            |address| {
-                lookups += 1;
-                (address == pool.as_slice()).then(|| protocol_component(&pool))
-            },
-        );
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |address| {
+            lookups += 1;
+            (address == pool.as_slice()).then(|| protocol_component(&pool))
+        });
 
         assert_eq!(lookups, 1);
         assert_eq!(attribute_value(&changes, &pool, "reserve0"), BigInt::from(3));
@@ -527,11 +502,10 @@ mod tests {
         )]);
         let mut lookups = 0;
 
-        let changes =
-            collect_protocol_changes(&block, BlockChanges::default(), &Params::default(), |_| {
-                lookups += 1;
-                None
-            });
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |_| {
+            lookups += 1;
+            None
+        });
 
         assert_eq!(lookups, 1);
         assert!(changes.changes.is_empty());
@@ -550,15 +524,10 @@ mod tests {
         )]);
         let mut lookups = 0;
 
-        let changes = collect_protocol_changes(
-            &block,
-            BlockChanges::default(),
-            &Params::default(),
-            |address| {
-                lookups += 1;
-                (address == pool.as_slice()).then(|| protocol_component(&pool))
-            },
-        );
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |address| {
+            lookups += 1;
+            (address == pool.as_slice()).then(|| protocol_component(&pool))
+        });
 
         assert_eq!(lookups, 1);
         assert_eq!(attribute_value(&changes, &pool, K_LAST_ATTRIBUTE), BigInt::from(3));
@@ -574,15 +543,10 @@ mod tests {
         )]);
         let mut lookups = 0;
 
-        let changes = collect_protocol_changes(
-            &block,
-            BlockChanges::default(),
-            &Params::default(),
-            |address| {
-                lookups += 1;
-                (address == pool.as_slice()).then(|| protocol_component(&pool))
-            },
-        );
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |address| {
+            lookups += 1;
+            (address == pool.as_slice()).then(|| protocol_component(&pool))
+        });
 
         assert_eq!(lookups, 1);
         assert_eq!(attribute_value(&changes, &pool, "reserve0"), BigInt::from(1));
@@ -603,16 +567,11 @@ mod tests {
         )]);
         let mut lookups = 0;
 
-        let changes = collect_protocol_changes(
-            &block,
-            BlockChanges::default(),
-            &Params::default(),
-            |address| {
-                lookups += 1;
-                (address == pool.as_slice() || address == other_pool.as_slice())
-                    .then(|| protocol_component(address))
-            },
-        );
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |address| {
+            lookups += 1;
+            (address == pool.as_slice() || address == other_pool.as_slice())
+                .then(|| protocol_component(address))
+        });
 
         assert_eq!(lookups, 1);
         assert_eq!(attribute_value(&changes, &pool, K_LAST_ATTRIBUTE), BigInt::from(2));
@@ -632,15 +591,10 @@ mod tests {
         );
         let mut lookups = 0;
 
-        let changes = collect_protocol_changes(
-            &block,
-            BlockChanges::default(),
-            &Params { use_bloom_gate: true },
-            |_| {
-                lookups += 1;
-                Some(protocol_component(&pool))
-            },
-        );
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |_| {
+            lookups += 1;
+            Some(protocol_component(&pool))
+        });
 
         assert_eq!(lookups, 0);
         assert!(changes.changes.is_empty());
@@ -655,15 +609,10 @@ mod tests {
         );
         let mut lookups = 0;
 
-        let changes = collect_protocol_changes(
-            &block,
-            BlockChanges::default(),
-            &Params { use_bloom_gate: true },
-            |address| {
-                lookups += 1;
-                (address == pool.as_slice()).then(|| protocol_component(&pool))
-            },
-        );
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |address| {
+            lookups += 1;
+            (address == pool.as_slice()).then(|| protocol_component(&pool))
+        });
 
         assert_eq!(lookups, 1);
         assert_eq!(attribute_value(&changes, &pool, "reserve0"), BigInt::from(1));
@@ -716,11 +665,10 @@ mod tests {
             block_with_transactions(vec![failed, transaction(1, Vec::new(), vec![reverted_call])]);
         let mut lookups = 0;
 
-        let changes =
-            collect_protocol_changes(&block, BlockChanges::default(), &Params::default(), |_| {
-                lookups += 1;
-                Some(protocol_component(&pool))
-            });
+        let changes = collect_protocol_changes(&block, BlockChanges::default(), |_| {
+            lookups += 1;
+            Some(protocol_component(&pool))
+        });
 
         assert_eq!(lookups, 0);
         assert!(changes.changes.is_empty());
