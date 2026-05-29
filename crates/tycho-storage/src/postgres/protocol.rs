@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use chrono::{NaiveDateTime, Utc};
 use diesel::{
     prelude::*,
+    sql_types::{Array, BigInt, Binary, Jsonb, Nullable, Text, Timestamptz},
     upsert::{excluded, on_constraint},
 };
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -33,6 +34,27 @@ use super::{
 pub(crate) struct ProtocolTxMetadata {
     pub index: u64,
     pub ts: NaiveDateTime,
+}
+
+#[derive(QueryableByName)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+struct FullProtocolComponentRow {
+    #[diesel(sql_type = Text)]
+    external_id: String,
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    attributes: Option<serde_json::Value>,
+    #[diesel(sql_type = Timestamptz)]
+    created_at: NaiveDateTime,
+    #[diesel(sql_type = Binary)]
+    creation_tx: TxHash,
+    #[diesel(sql_type = Text)]
+    protocol_system: String,
+    #[diesel(sql_type = Text)]
+    protocol_type_name: String,
+    #[diesel(sql_type = Array<Binary>)]
+    token_addresses: Vec<Address>,
+    #[diesel(sql_type = Array<Binary>)]
+    contract_addresses: Vec<Address>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -463,6 +485,13 @@ impl PostgresGateway {
         use super::schema::{protocol_component::dsl::*, transaction::dsl::*};
         let chain_id_value = self.get_chain_id(chain)?;
 
+        if system.is_none() && ids.is_none() && min_tvl.is_none() && pagination_params.is_none() {
+            let res = self
+                .get_all_protocol_components_for_chain(*chain, chain_id_value, conn)
+                .await?;
+            return Ok(WithTotal { total: Some(res.len() as i64), entity: res });
+        }
+
         let mut count_query = protocol_component
             .left_join(schema::component_tvl::table)
             .into_boxed();
@@ -554,6 +583,108 @@ impl PostgresGateway {
             .await?;
 
         Ok(WithTotal { entity: res, total: Some(count) })
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all, fields(chain = %chain))]
+    async fn get_all_protocol_components_for_chain(
+        &self,
+        chain: Chain,
+        chain_id: i64,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<Vec<ProtocolComponent>, StorageError> {
+        let rows: Vec<FullProtocolComponentRow> = diesel::sql_query(
+            r#"
+            WITH token_addresses AS (
+                SELECT
+                    pcht.protocol_component_id,
+                    array_agg(a.address ORDER BY pcht.token_index) AS token_addresses
+                FROM protocol_component pc
+                INNER JOIN protocol_component_holds_token pcht
+                    ON pcht.protocol_component_id = pc.id
+                INNER JOIN token t
+                    ON t.id = pcht.token_id
+                INNER JOIN account a
+                    ON a.id = t.account_id
+                WHERE pc.chain_id = $1
+                GROUP BY pcht.protocol_component_id
+            ),
+            contract_addresses AS (
+                SELECT
+                    pchc.protocol_component_id,
+                    array_agg(a.address ORDER BY a.address) AS contract_addresses
+                FROM protocol_component pc
+                INNER JOIN protocol_component_holds_contract pchc
+                    ON pchc.protocol_component_id = pc.id
+                INNER JOIN contract_code cc
+                    ON cc.id = pchc.contract_code_id
+                INNER JOIN account a
+                    ON a.id = cc.account_id
+                WHERE pc.chain_id = $1
+                GROUP BY pchc.protocol_component_id
+            )
+            SELECT
+                pc.external_id::text AS external_id,
+                pc.attributes,
+                pc.created_at,
+                tx.hash AS creation_tx,
+                ps.name::text AS protocol_system,
+                pt.name::text AS protocol_type_name,
+                COALESCE(ta.token_addresses, ARRAY[]::bytea[]) AS token_addresses,
+                COALESCE(ca.contract_addresses, ARRAY[]::bytea[]) AS contract_addresses
+            FROM protocol_component pc
+            INNER JOIN "transaction" tx
+                ON tx.id = pc.creation_tx
+            INNER JOIN protocol_system ps
+                ON ps.id = pc.protocol_system_id
+            INNER JOIN protocol_type pt
+                ON pt.id = pc.protocol_type_id
+            LEFT JOIN token_addresses ta
+                ON ta.protocol_component_id = pc.id
+            LEFT JOIN contract_addresses ca
+                ON ca.protocol_component_id = pc.id
+            WHERE pc.chain_id = $1
+            ORDER BY pc.id
+            "#,
+        )
+        .bind::<BigInt, _>(chain_id)
+        .load(conn)
+        .await
+        .map_err(PostgresError::from)?;
+
+        rows.into_iter()
+            .map(|row| {
+                if row.token_addresses.is_empty() {
+                    return Err(StorageError::NotFound(
+                        "ProtocolComponent tokens".to_string(),
+                        row.external_id,
+                    ));
+                }
+
+                let static_attributes: HashMap<String, StoreVal> =
+                    if let Some(attributes) = row.attributes {
+                        serde_json::from_value(attributes).map_err(|_| {
+                            StorageError::DecodeError(
+                                "Failed to decode static attributes.".to_string(),
+                            )
+                        })?
+                    } else {
+                        Default::default()
+                    };
+
+                Ok(ProtocolComponent::new(
+                    &row.external_id,
+                    &row.protocol_system,
+                    &row.protocol_type_name,
+                    chain,
+                    row.token_addresses,
+                    row.contract_addresses,
+                    static_attributes,
+                    ChangeType::Creation,
+                    row.creation_tx,
+                    row.created_at,
+                ))
+            })
+            .collect()
     }
 
     #[instrument(level = Level::DEBUG, skip(self, orm_protocol_components, conn))]
