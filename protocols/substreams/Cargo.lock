@@ -3104,6 +3104,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "token-balances"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "hex",
+ "hex-literal 0.4.1",
+ "itertools 0.12.1",
+ "rustc-hash",
+ "serde",
+ "serde_qs 0.13.0",
+ "substreams 0.5.22",
+ "substreams-ethereum 0.9.13",
+ "tiny-keccak",
+ "tycho-substreams 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

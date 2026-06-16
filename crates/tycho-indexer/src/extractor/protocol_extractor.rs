@@ -14,6 +14,7 @@ use prost::Message;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, error, info, info_span, instrument, trace, warn, Instrument};
 use tycho_common::{
+    keccak256,
     models::{
         blockchain::{
             Block, BlockAggregatedChanges, BlockTag, DCIUpdate, EntryPoint, TracingParams,
@@ -613,6 +614,12 @@ where
             .protocol_components()
             .into_iter()
             .flat_map(|pc| pc.tokens.clone().into_iter())
+            .chain(
+                msg.txs_with_update
+                    .iter()
+                    .flat_map(|tx| tx.account_balance_changes.values())
+                    .flat_map(|balances| balances.keys().cloned()),
+            )
             .collect::<Vec<_>>();
 
         // Separate between known and unkown tokens
@@ -633,7 +640,7 @@ where
             .map(|(addr, _)| addr)
             .collect::<Vec<_>>();
         // Construct unkown tokens using rpc
-        let balance_map: HashMap<Address, (Address, Balance)> = msg
+        let mut balance_map: HashMap<Address, (Address, Balance)> = msg
             .txs_with_update
             .iter()
             .flat_map(|tx| {
@@ -680,6 +687,18 @@ where
                     .flatten()
             })
             .collect::<HashMap<_, _>>();
+        balance_map.extend(
+            msg.txs_with_update
+                .iter()
+                .flat_map(|tx| tx.account_balance_changes.iter())
+                .flat_map(|(account, balances)| {
+                    balances
+                        .iter()
+                        .map(move |(token, balance)| {
+                            (token.clone(), (account.clone(), balance.balance.clone()))
+                        })
+                }),
+        );
         let tf = TokenOwnerStore::new(balance_map);
         let existing_tokens = self
             .protocol_cache
@@ -1537,6 +1556,7 @@ pub struct ExtractorPgGateway {
     chain: Chain,
     db_tx_batch_size: usize,
     state_gateway: CachedGateway,
+    balance_account_cache: Mutex<HashSet<Address>>,
 }
 
 #[automock]
@@ -1580,7 +1600,13 @@ impl ExtractorPgGateway {
         db_tx_batch_size: usize,
         state_gateway: CachedGateway,
     ) -> Self {
-        Self { name: name.to_owned(), chain, db_tx_batch_size, state_gateway }
+        Self {
+            name: name.to_owned(),
+            chain,
+            db_tx_batch_size,
+            state_gateway,
+            balance_account_cache: Mutex::new(HashSet::new()),
+        }
     }
 
     #[instrument(skip_all)]
@@ -1609,6 +1635,64 @@ impl ExtractorPgGateway {
             .await?;
         Ok(state)
     }
+
+    async fn ensure_balance_accounts(
+        &self,
+        account_txs: HashMap<Address, TxHash>,
+        created_accounts: &HashSet<Address>,
+    ) -> Result<(), StorageError> {
+        let (accounts_to_insert, accounts_to_cache) = {
+            let cached_accounts = self.balance_account_cache.lock().await;
+            let mut accounts_to_insert = Vec::new();
+            let mut accounts_to_cache = Vec::new();
+
+            for (account, tx_hash) in account_txs {
+                if cached_accounts.contains(&account) {
+                    continue;
+                }
+
+                accounts_to_cache.push(account.clone());
+                if !created_accounts.contains(&account) {
+                    accounts_to_insert.push((account, tx_hash));
+                }
+            }
+
+            (accounts_to_insert, accounts_to_cache)
+        };
+
+        for (account, tx_hash) in accounts_to_insert {
+            let account = balance_account(self.chain, account, tx_hash);
+            self.state_gateway
+                .insert_contract(&account)
+                .await?;
+        }
+
+        if !accounts_to_cache.is_empty() {
+            self.balance_account_cache
+                .lock()
+                .await
+                .extend(accounts_to_cache);
+        }
+
+        Ok(())
+    }
+}
+
+fn balance_account(chain: Chain, address: Address, tx_hash: TxHash) -> Account {
+    let empty_hash = keccak256(Vec::new());
+    Account::new(
+        chain,
+        address.clone(),
+        format!("{:#020x}", address),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        empty_hash.into(),
+        tx_hash.clone(),
+        tx_hash.clone(),
+        Some(tx_hash),
+    )
 }
 
 #[async_trait]
@@ -1670,6 +1754,8 @@ impl ExtractorGateway for ExtractorPgGateway {
         let mut account_changes: Vec<(Bytes, AccountDelta)> = vec![];
         let mut component_balance_changes: Vec<ComponentBalance> = vec![];
         let mut account_balance_changes: Vec<AccountBalance> = vec![];
+        let mut account_balance_accounts: HashMap<Address, TxHash> = HashMap::new();
+        let mut created_accounts: HashSet<Address> = HashSet::new();
         let mut protocol_tokens: HashSet<Bytes> = HashSet::new();
         let mut new_entrypoints: HashMap<ComponentId, HashSet<EntryPoint>> = HashMap::new();
         let mut new_entrypoint_params: HashMap<
@@ -1698,6 +1784,7 @@ impl ExtractorGateway for ExtractorPgGateway {
                 if account_update.is_creation() {
                     let new: Account = account_update.ref_into_account(&tx_update.tx);
                     info!(block_number = ?changes.block.number, contract_address = ?new.address, "NewContract");
+                    created_accounts.insert(new.address.clone());
 
                     // Insert new account static values
                     self.state_gateway
@@ -1747,13 +1834,17 @@ impl ExtractorGateway for ExtractorPgGateway {
             );
 
             // Map account balance changes
-            account_balance_changes.extend(
-                tx_update
-                    .account_balance_changes
-                    .clone()
-                    .into_values()
-                    .flat_map(|tokens_balances| tokens_balances.into_values()),
-            );
+            for account_balances in tx_update
+                .account_balance_changes
+                .values()
+            {
+                for balance in account_balances.values() {
+                    account_balance_accounts
+                        .entry(balance.account.clone())
+                        .or_insert_with(|| tx_update.tx.hash.clone());
+                    account_balance_changes.push(balance.clone());
+                }
+            }
 
             // Map new entrypoints
             for (component_id, entrypoints) in tx_update
@@ -1818,6 +1909,8 @@ impl ExtractorGateway for ExtractorPgGateway {
 
         // Insert account balance changes
         if !account_balance_changes.is_empty() {
+            self.ensure_balance_accounts(account_balance_accounts, &created_accounts)
+                .await?;
             self.state_gateway
                 .add_account_balances(account_balance_changes.as_slice())
                 .await?;
