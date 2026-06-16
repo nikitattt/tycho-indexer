@@ -55,7 +55,7 @@ pub struct ConstantRetryConfiguration {
 pub struct TychoStreamBuilder {
     tycho_url: String,
     chain: Chain,
-    exchanges: HashMap<String, ComponentFilter>,
+    exchanges: HashMap<String, ExtractorFeedMode>,
     blocklisted_ids: HashSet<String>,
     block_time: u64,
     timeout: u64,
@@ -69,6 +69,12 @@ pub struct TychoStreamBuilder {
     include_tvl: bool,
     compression: bool,
     partial_blocks: bool,
+}
+
+#[derive(Clone, Debug)]
+enum ExtractorFeedMode {
+    ComponentState { filter: ComponentFilter },
+    AccountBalances,
 }
 
 impl TychoStreamBuilder {
@@ -120,7 +126,18 @@ impl TychoStreamBuilder {
     /// Adds an exchange and its corresponding filter to the Tycho client.
     pub fn exchange(mut self, name: &str, filter: ComponentFilter) -> Self {
         self.exchanges
-            .insert(name.to_string(), filter);
+            .insert(name.to_string(), ExtractorFeedMode::ComponentState { filter });
+        self
+    }
+
+    /// Adds a balance-only extractor to the Tycho client.
+    ///
+    /// Balance-only extractors participate in the same WebSocket connection and block
+    /// synchronization pipeline as component-based exchanges, but their `account_balances`
+    /// payload is forwarded without component or contract filtering.
+    pub fn account_balance_exchange(mut self, name: &str) -> Self {
+        self.exchanges
+            .insert(name.to_string(), ExtractorFeedMode::AccountBalances);
         self
     }
 
@@ -292,37 +309,48 @@ impl TychoStreamBuilder {
         let dci_protocols = info.dci_protocols;
 
         // Register each exchange with the BlockSynchronizer
-        for (name, filter) in self
-            .exchanges
-            .into_iter()
-            .map(|(name, filter)| {
-                let filter = if self.blocklisted_ids.is_empty() {
-                    filter
-                } else {
-                    filter.blocklist(self.blocklisted_ids.iter().cloned())
-                };
-                (name, filter)
-            })
-        {
+        for (name, mode) in self.exchanges.into_iter() {
             info!("Registering exchange: {}", name);
             let id = ExtractorIdentity { chain: self.chain, name: name.clone() };
             let uses_dci = dci_protocols.contains(&name);
             let sync = match &self.state_sync_retry_config {
-                RetryConfiguration::Constant(retry_config) => ProtocolStateSynchronizer::new(
-                    id.clone(),
-                    true,
-                    filter,
-                    retry_config.max_attempts,
-                    retry_config.cooldown,
-                    !self.no_state,
-                    self.include_tvl,
-                    self.compression,
-                    rpc_client.clone(),
-                    ws_client.clone(),
-                    self.block_time + self.timeout,
-                )
-                .with_dci(uses_dci)
-                .with_partial_blocks(self.partial_blocks),
+                RetryConfiguration::Constant(retry_config) => {
+                    let sync = match mode {
+                        ExtractorFeedMode::ComponentState { filter } => {
+                            let filter = if self.blocklisted_ids.is_empty() {
+                                filter
+                            } else {
+                                filter.blocklist(self.blocklisted_ids.iter().cloned())
+                            };
+                            ProtocolStateSynchronizer::new(
+                                id.clone(),
+                                true,
+                                filter,
+                                retry_config.max_attempts,
+                                retry_config.cooldown,
+                                !self.no_state,
+                                self.include_tvl,
+                                self.compression,
+                                rpc_client.clone(),
+                                ws_client.clone(),
+                                self.block_time + self.timeout,
+                            )
+                            .with_dci(uses_dci)
+                        }
+                        ExtractorFeedMode::AccountBalances => {
+                            ProtocolStateSynchronizer::new_account_balances(
+                                id.clone(),
+                                retry_config.max_attempts,
+                                retry_config.cooldown,
+                                self.compression,
+                                rpc_client.clone(),
+                                ws_client.clone(),
+                                self.block_time + self.timeout,
+                            )
+                        }
+                    };
+                    sync.with_partial_blocks(self.partial_blocks)
+                }
             };
             block_sync = block_sync.register_synchronizer(id, sync);
         }
@@ -486,6 +514,19 @@ mod tests {
         let builder = TychoStreamBuilder::new("localhost:4242", Chain::Ethereum);
         assert!(builder.compression, "Compression should be enabled by default.");
         assert!(!builder.partial_blocks, "partial_blocks should be disabled by default.");
+    }
+
+    #[test]
+    fn test_account_balance_exchange_registers_balance_mode() {
+        let builder = TychoStreamBuilder::new("localhost:4242", Chain::Ethereum)
+            .account_balance_exchange("tokenjar_balances");
+
+        assert!(matches!(
+            builder
+                .exchanges
+                .get("tokenjar_balances"),
+            Some(ExtractorFeedMode::AccountBalances)
+        ));
     }
 
     #[tokio::test]

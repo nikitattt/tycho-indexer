@@ -81,6 +81,7 @@ impl From<DeltasError> for SynchronizerError {
 
 pub struct ProtocolStateSynchronizer<R: RPCClient, D: DeltasClient> {
     extractor_id: ExtractorIdentity,
+    feed_mode: SynchronizerFeedMode,
     retrieve_balances: bool,
     rpc_client: R,
     deltas_client: D,
@@ -97,6 +98,12 @@ pub struct ProtocolStateSynchronizer<R: RPCClient, D: DeltasClient> {
     /// Brand-new components (in new_protocol_components) whose snapshot we deferred until the
     /// first message of the next block. Only used when partial_blocks is true.
     deferred_snapshot_components: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SynchronizerFeedMode {
+    ComponentState,
+    AccountBalances,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -241,6 +248,7 @@ where
     ) -> Self {
         Self {
             extractor_id: extractor_id.clone(),
+            feed_mode: SynchronizerFeedMode::ComponentState,
             retrieve_balances,
             rpc_client: rpc_client.clone(),
             include_snapshots,
@@ -256,6 +264,41 @@ where
             last_synced_block: None,
             timeout,
             include_tvl,
+            compression,
+            partial_blocks: false,
+            uses_dci: false,
+            deferred_snapshot_components: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_account_balances(
+        extractor_id: ExtractorIdentity,
+        max_retries: u64,
+        retry_cooldown: Duration,
+        compression: bool,
+        rpc_client: R,
+        deltas_client: D,
+        timeout: u64,
+    ) -> Self {
+        Self {
+            extractor_id: extractor_id.clone(),
+            feed_mode: SynchronizerFeedMode::AccountBalances,
+            retrieve_balances: false,
+            rpc_client: rpc_client.clone(),
+            include_snapshots: false,
+            deltas_client,
+            component_tracker: ComponentTracker::new(
+                extractor_id.chain,
+                extractor_id.name.as_str(),
+                ComponentFilter::Ids(Vec::new()),
+                rpc_client,
+            ),
+            max_retries,
+            retry_cooldown,
+            last_synced_block: None,
+            timeout,
+            include_tvl: false,
             compression,
             partial_blocks: false,
             uses_dci: false,
@@ -283,7 +326,7 @@ where
         &mut self,
         header: &BlockHeader,
     ) -> SyncResult<Snapshot> {
-        if !self.partial_blocks {
+        if !self.partial_blocks || self.is_account_balance_mode() {
             return Ok(Snapshot::default());
         }
         let prev = match self
@@ -312,7 +355,7 @@ where
         header: BlockHeader,
         ids: Option<I>,
     ) -> SyncResult<StateSyncMessage<BlockHeader>> {
-        if !self.include_snapshots {
+        if !self.include_snapshots || self.is_account_balance_mode() {
             return Ok(StateSyncMessage { header, ..Default::default() });
         }
 
@@ -512,7 +555,7 @@ where
             };
 
             // If possible skip retrieving snapshots
-            let msg = if !self.is_next_expected(&header) {
+            let msg = if !self.is_next_expected(&header) && !self.is_account_balance_mode() {
                 info!("Retrieving snapshot");
                 // With partial blocks, the server only has full blocks in its buffer; pass the
                 // previous block's header so we request state at N-1, then merge with deltas.
@@ -548,7 +591,9 @@ where
                             let flushed_snapshots =
                                 self.take_flushed_deferred_snapshots(&header).await?;
 
-                            let (snapshots, removed_components) = {
+                            let (snapshots, removed_components) = if self.is_account_balance_mode() {
+                                (Snapshot::default(), HashMap::new())
+                            } else {
                                 // 1. Remove components based on latest changes
                                 // 2. Add components based on latest changes, query those for snapshots
                                 let (to_add, to_remove) = self.component_tracker.filter_updated_components(&deltas);
@@ -613,7 +658,9 @@ where
                             };
 
                             // 3. Update entrypoints on the tracker (affects which contracts are tracked)
-                            self.component_tracker.process_entrypoints(&deltas.dci_update);
+                            if !self.is_account_balance_mode() {
+                                self.component_tracker.process_entrypoints(&deltas.dci_update);
+                            }
 
                             // 4. Filter deltas by currently tracked components / contracts
                             self.filter_deltas(&mut deltas);
@@ -672,7 +719,16 @@ where
         }
         false
     }
+
+    fn is_account_balance_mode(&self) -> bool {
+        self.feed_mode == SynchronizerFeedMode::AccountBalances
+    }
+
     fn filter_deltas(&self, deltas: &mut BlockChanges) {
+        if self.is_account_balance_mode() {
+            return;
+        }
+
         deltas.filter_by_component(|id| {
             self.component_tracker
                 .components
@@ -693,6 +749,14 @@ where
     D: DeltasClient + Clone + Send + Sync + 'static,
 {
     async fn initialize(&mut self) -> SyncResult<()> {
+        if self.is_account_balance_mode() {
+            info!(
+                extractor = %self.extractor_id,
+                "Skipping component initialization for account-balance extractor",
+            );
+            return Ok(());
+        }
+
         info!("Retrieving relevant protocol components");
         self.component_tracker
             .initialise_components()
@@ -800,12 +864,13 @@ mod test {
     use std::{collections::HashSet, sync::Arc};
 
     use tycho_common::dto::{
-        AddressStorageLocation, Block, Chain, ComponentTvlRequestBody, ComponentTvlRequestResponse,
-        DCIUpdate, EntryPoint, PaginationResponse, ProtocolComponentRequestResponse,
-        ProtocolComponentsRequestBody, ProtocolStateRequestBody, ProtocolStateRequestResponse,
-        ProtocolSystemsRequestBody, ProtocolSystemsRequestResponse, RPCTracerParams,
-        StateRequestBody, StateRequestResponse, TokensRequestBody, TokensRequestResponse,
-        TracedEntryPointRequestBody, TracedEntryPointRequestResponse, TracingParams,
+        AccountBalance, AddressStorageLocation, Block, Chain, ComponentTvlRequestBody,
+        ComponentTvlRequestResponse, DCIUpdate, EntryPoint, PaginationResponse,
+        ProtocolComponentRequestResponse, ProtocolComponentsRequestBody, ProtocolStateRequestBody,
+        ProtocolStateRequestResponse, ProtocolSystemsRequestBody, ProtocolSystemsRequestResponse,
+        RPCTracerParams, StateRequestBody, StateRequestResponse, TokensRequestBody,
+        TokensRequestResponse, TracedEntryPointRequestBody, TracedEntryPointRequestResponse,
+        TracingParams,
     };
     use uuid::Uuid;
 
@@ -1620,6 +1685,89 @@ mod test {
             .return_once(|_| Ok(()));
 
         (rpc_client, deltas_client, tx)
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_account_balance_sync_preserves_balances_without_component_filtering() {
+        let rpc_client = make_mock_client();
+        let mut deltas_client = MockDeltasClient::new();
+        let (tx, rx) = channel(1);
+        deltas_client
+            .expect_subscribe()
+            .return_once(move |extractor_id, _| {
+                assert_eq!(extractor_id.name, "tokenjar_balances");
+                Ok((Uuid::default(), rx))
+            });
+        deltas_client
+            .expect_unsubscribe()
+            .return_once(|_| Ok(()));
+
+        let rpc_client = ArcRPCClient(Arc::new(rpc_client));
+        let deltas_client = ArcDeltasClient(Arc::new(deltas_client));
+        let mut state_sync = ProtocolStateSynchronizer::new_account_balances(
+            ExtractorIdentity::new(Chain::Ethereum, "tokenjar_balances"),
+            1,
+            Duration::from_secs(0),
+            true,
+            rpc_client,
+            deltas_client,
+            10_u64,
+        );
+
+        state_sync
+            .initialize()
+            .await
+            .expect("Init failed");
+
+        let (handle, mut rx) = state_sync.start().await;
+        let (jh, close_tx) = handle.split();
+
+        let holder = Bytes::from("0x1111");
+        let token = Bytes::from("0x2222");
+        let balance = AccountBalance {
+            account: holder.clone(),
+            token: token.clone(),
+            balance: Bytes::from("0x2a"),
+            modify_tx: Bytes::from("0xabcd"),
+        };
+        let deltas = BlockChanges {
+            extractor: "tokenjar_balances".to_string(),
+            chain: Chain::Ethereum,
+            block: Block {
+                number: 1,
+                hash: Bytes::from("0x01"),
+                parent_hash: Bytes::from("0x00"),
+                chain: Chain::Ethereum,
+                ts: Default::default(),
+            },
+            account_balances: HashMap::from([(
+                holder.clone(),
+                HashMap::from([(token.clone(), balance.clone())]),
+            )]),
+            ..Default::default()
+        };
+
+        tx.send(deltas.clone())
+            .await
+            .expect("deltas channel closed");
+        let msg = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("waiting for state msg timed out")
+            .expect("state sync block sender closed")
+            .expect("state sync failed");
+
+        assert_eq!(msg.snapshots, Snapshot::default());
+        assert!(msg.removed_components.is_empty());
+        assert_eq!(
+            msg.deltas
+                .expect("missing deltas")
+                .account_balances,
+            deltas.account_balances
+        );
+
+        let _ = close_tx.send(());
+        jh.await
+            .expect("state sync task panicked");
     }
 
     /// Test strategy
