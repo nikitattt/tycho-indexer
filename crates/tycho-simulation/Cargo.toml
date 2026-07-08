@@ -55,6 +55,7 @@ alloy = { workspace = true, features = [
     "sol-types",
     "rand",
     "dyn-abi",
+    "eip712",
     "json-abi",
 ], optional = true }
 foundry-block-explorers = { version = "0.22.0", optional = true }

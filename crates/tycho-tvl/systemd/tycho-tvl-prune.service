@@ -1,0 +1,12 @@
+[Unit]
+Description=Tycho TVL stale component pruner
+After=network-online.target postgresql.service tycho-indexer.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/tycho/tvl.env
+ExecStart=/usr/local/bin/tycho-tvl --run-mode prune-stale-components --active-window-days 42 --prune-min-tvl 0.1
+User=tycho
+Group=tycho
+RuntimeMaxSec=3600

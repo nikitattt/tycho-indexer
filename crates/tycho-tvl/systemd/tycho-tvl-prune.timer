@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Tycho Indexer TVL stale component pruner daily
+
+[Timer]
+OnBootSec=10min
+OnCalendar=daily
+Persistent=true
+AccuracySec=5min
+Unit=tycho-tvl-prune.service
+
+[Install]
+WantedBy=timers.target
