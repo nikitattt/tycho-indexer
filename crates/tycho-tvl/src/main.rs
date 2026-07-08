@@ -1508,6 +1508,7 @@ fn hard_anchors(chain: &Chain) -> HashMap<Bytes, f64> {
     let address = match chain {
         Chain::Ethereum => Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
         Chain::Base | Chain::Unichain => Some("0x4200000000000000000000000000000000000006"),
+        Chain::Robinhood => Some("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"),
         _ => None,
     };
     if let Some(address) = address {
@@ -1558,6 +1559,14 @@ mod tests {
         assert_eq!(update_rate_bps(100, 10_000), 100.0);
         assert_eq!(update_rate_bps(25, 50_000), 5.0);
         assert_eq!(update_rate_bps(1, 0), 0.0);
+    }
+
+    #[test]
+    fn robinhood_hard_anchor_uses_weth() {
+        let anchors = hard_anchors(&Chain::Robinhood);
+        let weth = Bytes::from_str("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73").unwrap();
+
+        assert_eq!(anchors.get(&weth), Some(&1.0));
     }
 
     #[test]
