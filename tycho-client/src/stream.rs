@@ -120,6 +120,7 @@ impl TychoStreamBuilder {
             Chain::Bsc => (1, 12, 50),
             Chain::Unichain => (1, 10, 100),
             Chain::Polygon => (2, 12, 50), // ~2s block time
+            Chain::Robinhood => (1, 10, 100),
         }
     }
 
@@ -514,6 +515,16 @@ mod tests {
         let builder = TychoStreamBuilder::new("localhost:4242", Chain::Ethereum);
         assert!(builder.compression, "Compression should be enabled by default.");
         assert!(!builder.partial_blocks, "partial_blocks should be disabled by default.");
+    }
+
+    #[test]
+    fn test_robinhood_stream_builder_defaults() {
+        let builder = TychoStreamBuilder::new("localhost:4242", Chain::Robinhood);
+
+        assert_eq!(builder.block_time, 1);
+        assert_eq!(builder.timeout, 10);
+        assert_eq!(builder.max_missed_blocks, 100);
+        assert_eq!(builder.startup_timeout, Duration::from_secs(100));
     }
 
     #[test]
