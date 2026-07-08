@@ -116,6 +116,7 @@ impl TychoStreamBuilder {
             Chain::Bsc => (1, 12, 50),
             Chain::Unichain => (1, 10, 100),
             Chain::Polygon => (2, 12, 50), // ~2s block time
+            Chain::Robinhood => (1, 10, 100),
         }
     }
 
