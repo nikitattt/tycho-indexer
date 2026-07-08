@@ -84,6 +84,7 @@ pub enum Chain {
     Bsc,
     Unichain,
     Polygon,
+    Robinhood,
 }
 
 impl From<dto::Chain> for Chain {
@@ -97,6 +98,7 @@ impl From<dto::Chain> for Chain {
             dto::Chain::Bsc => Chain::Bsc,
             dto::Chain::Unichain => Chain::Unichain,
             dto::Chain::Polygon => Chain::Polygon,
+            dto::Chain::Robinhood => Chain::Robinhood,
         }
     }
 }
@@ -160,6 +162,7 @@ impl Chain {
             Chain::Bsc => 56,
             Chain::Unichain => 130,
             Chain::Polygon => 137,
+            Chain::Robinhood => 4663,
         }
     }
 
@@ -176,6 +179,7 @@ impl Chain {
             Chain::Bsc => native_bsc(Chain::Bsc),
             Chain::Unichain => native_eth(Chain::Unichain),
             Chain::Polygon => native_pol(Chain::Polygon),
+            Chain::Robinhood => native_eth(Chain::Robinhood),
         }
     }
 
@@ -206,6 +210,9 @@ impl Chain {
             }
             Chain::Polygon => {
                 wrapped_native_pol(Chain::Polygon, "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270")
+            }
+            Chain::Robinhood => {
+                wrapped_native_eth(Chain::Robinhood, "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73")
             }
         }
     }

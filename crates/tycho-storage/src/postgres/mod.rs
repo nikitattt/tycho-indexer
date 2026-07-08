@@ -514,6 +514,10 @@ impl PostgresGateway {
             .try_get_value(id)
     }
 
+    pub(crate) fn retention_horizon(&self) -> NaiveDateTime {
+        self.retention_horizon
+    }
+
     pub async fn new(
         pool: Pool<AsyncPgConnection>,
         retention_horizon: NaiveDateTime,

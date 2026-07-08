@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    env,
     num::NonZeroUsize,
     sync::Arc,
 };
@@ -115,6 +116,585 @@ impl WriteOp {
             WriteOp::UpsertTracedEntryPoints(_) => 12,
             WriteOp::SaveExtractionState(_) => 13,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BatchTxOptimizationConfig {
+    write_only_referenced_txs: bool,
+    retention_compact_protocol_writes: bool,
+}
+
+impl BatchTxOptimizationConfig {
+    fn from_env() -> Self {
+        Self {
+            write_only_referenced_txs: env_flag("TYCHO_WRITE_ONLY_REFERENCED_TXS"),
+            retention_compact_protocol_writes: env_flag(
+                "TYCHO_EXPERIMENTAL_RETENTION_COMPACT_PROTOCOL_WRITES",
+            ),
+        }
+    }
+
+    fn mode_name(&self) -> &'static str {
+        match (self.write_only_referenced_txs, self.retention_compact_protocol_writes) {
+            (_, true) => "retention_compact_protocol_writes",
+            (true, false) => "write_only_referenced_txs_observe_only",
+            (false, false) => "observe",
+        }
+    }
+
+    fn filters_transactions(&self) -> bool {
+        false
+    }
+
+    fn logs_projection_stats(&self) -> bool {
+        env_flag("TYCHO_LOG_BATCH_TX_PROJECTION_STATS")
+            || (!self.retention_compact_protocol_writes && !self.write_only_referenced_txs)
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TxOrdering {
+    block_ts: NaiveDateTime,
+    block_number: u64,
+    tx_index: u64,
+}
+
+impl TxOrdering {
+    fn sort_key(&self) -> (NaiveDateTime, u64, u64) {
+        (self.block_ts, self.block_number, self.tx_index)
+    }
+}
+
+#[derive(Debug, Default)]
+struct BatchTxOptimizationStats {
+    tx_rows_total: usize,
+    tx_rows_unique: usize,
+    tx_rows_kept: usize,
+    tx_rows_dropped: usize,
+    tx_rows_droppable_raw: usize,
+    tx_rows_droppable_after_compaction: usize,
+    tx_required_raw: usize,
+    tx_required_after_compaction: usize,
+    tx_required_missing_from_batch_raw: usize,
+    tx_required_missing_from_batch_after_compaction: usize,
+    tx_missing_ordering_metadata: usize,
+    component_balance_rows_raw: usize,
+    component_balance_rows_compacted: usize,
+    protocol_state_updated_attrs_raw: usize,
+    protocol_state_updated_attrs_compacted: usize,
+    protocol_state_deleted_attrs: usize,
+    protocol_state_compaction_blocked_by_deletions: usize,
+}
+
+impl BatchTxOptimizationStats {
+    fn log(
+        &self,
+        config: BatchTxOptimizationConfig,
+        block_range: &BlockRange,
+        retention_horizon: NaiveDateTime,
+    ) {
+        debug!(
+            mode = config.mode_name(),
+            write_only_referenced_txs = config.write_only_referenced_txs,
+            retention_compact_protocol_writes = config.retention_compact_protocol_writes,
+            block_range = %block_range,
+            retention_horizon = %retention_horizon,
+            tx_rows_total = self.tx_rows_total,
+            tx_rows_unique = self.tx_rows_unique,
+            tx_rows_kept = self.tx_rows_kept,
+            tx_rows_dropped = self.tx_rows_dropped,
+            tx_rows_droppable_raw = self.tx_rows_droppable_raw,
+            tx_rows_droppable_after_compaction = self.tx_rows_droppable_after_compaction,
+            tx_required_raw = self.tx_required_raw,
+            tx_required_after_compaction = self.tx_required_after_compaction,
+            tx_required_missing_from_batch_raw = self.tx_required_missing_from_batch_raw,
+            tx_required_missing_from_batch_after_compaction =
+                self.tx_required_missing_from_batch_after_compaction,
+            tx_missing_ordering_metadata = self.tx_missing_ordering_metadata,
+            component_balance_rows_raw = self.component_balance_rows_raw,
+            component_balance_rows_compacted = self.component_balance_rows_compacted,
+            protocol_state_updated_attrs_raw = self.protocol_state_updated_attrs_raw,
+            protocol_state_updated_attrs_compacted = self.protocol_state_updated_attrs_compacted,
+            protocol_state_deleted_attrs = self.protocol_state_deleted_attrs,
+            protocol_state_compaction_blocked_by_deletions =
+                self.protocol_state_compaction_blocked_by_deletions,
+            "BatchTxOptimizationStats"
+        );
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProtocolCompactionStats {
+    component_balance_rows_raw: usize,
+    component_balance_rows_compacted: usize,
+    protocol_state_updated_attrs_raw: usize,
+    protocol_state_updated_attrs_compacted: usize,
+    protocol_state_deleted_attrs: usize,
+    protocol_state_compaction_blocked_by_deletions: usize,
+    tx_missing_ordering_metadata: usize,
+}
+
+fn collect_tx_hashes_in_upsert_tx(ops: &[WriteOp]) -> HashSet<TxHash> {
+    ops.iter()
+        .filter_map(|op| match op {
+            WriteOp::UpsertTx(txs) => Some(txs),
+            _ => None,
+        })
+        .flat_map(|txs| txs.iter().map(|tx| tx.hash.clone()))
+        .collect()
+}
+
+fn count_upsert_tx_rows(ops: &[WriteOp]) -> usize {
+    ops.iter()
+        .map(|op| match op {
+            WriteOp::UpsertTx(txs) => txs.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn count_droppable_upsert_tx_rows(ops: &[WriteOp], required: &HashSet<TxHash>) -> usize {
+    ops.iter()
+        .map(|op| match op {
+            WriteOp::UpsertTx(txs) => txs
+                .iter()
+                .filter(|tx| !required.contains(&tx.hash))
+                .count(),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn collect_tx_ordering(ops: &[WriteOp]) -> HashMap<TxHash, TxOrdering> {
+    let blocks: HashMap<_, _> = ops
+        .iter()
+        .filter_map(|op| match op {
+            WriteOp::UpsertBlock(blocks) => Some(blocks),
+            _ => None,
+        })
+        .flat_map(|blocks| {
+            blocks
+                .iter()
+                .map(|block| (block.hash.clone(), (block.ts, block.number)))
+        })
+        .collect();
+
+    ops.iter()
+        .filter_map(|op| match op {
+            WriteOp::UpsertTx(txs) => Some(txs),
+            _ => None,
+        })
+        .flat_map(|txs| {
+            txs.iter().filter_map(|tx| {
+                blocks.get(&tx.block_hash).map(|(block_ts, block_number)| {
+                    (
+                        tx.hash.clone(),
+                        TxOrdering {
+                            block_ts: *block_ts,
+                            block_number: *block_number,
+                            tx_index: tx.index,
+                        },
+                    )
+                })
+            })
+        })
+        .collect()
+}
+
+fn collect_protocol_tx_metadata(
+    ops: &[WriteOp],
+) -> HashMap<TxHash, super::protocol::ProtocolTxMetadata> {
+    collect_tx_ordering(ops)
+        .into_iter()
+        .map(|(hash, ordering)| {
+            (
+                hash,
+                super::protocol::ProtocolTxMetadata {
+                    index: ordering.tx_index,
+                    ts: ordering.block_ts,
+                },
+            )
+        })
+        .collect()
+}
+
+fn collect_upfront_required_tx_hashes(ops: &[WriteOp]) -> HashSet<TxHash> {
+    let mut required = HashSet::new();
+    for op in ops {
+        match op {
+            WriteOp::InsertContract(contracts) => {
+                required.extend(
+                    contracts
+                        .iter()
+                        .filter_map(|contract| contract.creation_tx.clone()),
+                );
+            }
+            WriteOp::UpdateContracts(contracts) => {
+                required.extend(contracts.iter().map(|(tx, _)| tx.clone()));
+            }
+            WriteOp::InsertAccountBalances(balances) => {
+                required.extend(balances.iter().map(|balance| balance.modify_tx.clone()));
+            }
+            WriteOp::InsertProtocolComponents(components) => {
+                required.extend(components.iter().map(|component| component.creation_tx.clone()));
+            }
+            _ => {}
+        }
+    }
+    required
+}
+
+fn collect_protocol_write_tx_hashes(ops: &[WriteOp]) -> HashSet<TxHash> {
+    let mut txs = HashSet::new();
+    for op in ops {
+        match op {
+            WriteOp::InsertComponentBalances(balances) => {
+                txs.extend(balances.iter().map(|balance| balance.modify_tx.clone()));
+            }
+            WriteOp::UpsertProtocolState(deltas) => {
+                txs.extend(deltas.iter().map(|(tx, _)| tx.clone()));
+            }
+            _ => {}
+        }
+    }
+    txs
+}
+
+fn has_protocol_versioned_writes(ops: &[WriteOp]) -> bool {
+    ops.iter().any(|op| match op {
+        WriteOp::InsertComponentBalances(balances) => !balances.is_empty(),
+        WriteOp::UpsertProtocolState(deltas) => !deltas.is_empty(),
+        _ => false,
+    })
+}
+
+fn collect_required_tx_hashes(ops: &[WriteOp]) -> HashSet<TxHash> {
+    let mut required = HashSet::new();
+    for op in ops {
+        match op {
+            WriteOp::InsertContract(contracts) => {
+                required.extend(
+                    contracts
+                        .iter()
+                        .filter_map(|contract| contract.creation_tx.clone()),
+                );
+            }
+            WriteOp::UpdateContracts(contracts) => {
+                required.extend(contracts.iter().map(|(tx, _)| tx.clone()));
+            }
+            WriteOp::InsertAccountBalances(balances) => {
+                required.extend(balances.iter().map(|balance| balance.modify_tx.clone()));
+            }
+            WriteOp::InsertProtocolComponents(components) => {
+                required.extend(components.iter().map(|component| component.creation_tx.clone()));
+            }
+            WriteOp::InsertComponentBalances(balances) => {
+                required.extend(balances.iter().map(|balance| balance.modify_tx.clone()));
+            }
+            WriteOp::UpsertProtocolState(deltas) => {
+                required.extend(deltas.iter().map(|(tx, _)| tx.clone()));
+            }
+            WriteOp::UpsertBlock(_)
+            | WriteOp::UpsertTx(_)
+            | WriteOp::SaveExtractionState(_)
+            | WriteOp::InsertTokens(_)
+            | WriteOp::UpdateTokens(_)
+            | WriteOp::InsertEntryPoints(_)
+            | WriteOp::InsertEntryPointTracingParams(_)
+            | WriteOp::UpsertTracedEntryPoints(_) => {}
+        }
+    }
+    required
+}
+
+fn compact_protocol_writes_for_retention(
+    ops: &mut [WriteOp],
+    tx_ordering: &HashMap<TxHash, TxOrdering>,
+    retention_horizon: NaiveDateTime,
+    apply: bool,
+) -> ProtocolCompactionStats {
+    let mut stats = ProtocolCompactionStats::default();
+    let mut missing_metadata = HashSet::new();
+
+    for op in ops.iter_mut() {
+        match op {
+            WriteOp::InsertComponentBalances(balances) => {
+                let (raw, compacted, missing) = compact_component_balances_for_retention(
+                    balances,
+                    tx_ordering,
+                    retention_horizon,
+                    apply,
+                );
+                stats.component_balance_rows_raw += raw;
+                stats.component_balance_rows_compacted += compacted;
+                missing_metadata.extend(missing);
+            }
+            WriteOp::UpsertProtocolState(deltas) => {
+                let (raw, compacted, deleted, blocked, missing) =
+                    compact_protocol_state_for_retention(
+                        deltas,
+                        tx_ordering,
+                        retention_horizon,
+                        apply,
+                    );
+                stats.protocol_state_updated_attrs_raw += raw;
+                stats.protocol_state_updated_attrs_compacted += compacted;
+                stats.protocol_state_deleted_attrs += deleted;
+                stats.protocol_state_compaction_blocked_by_deletions += blocked;
+                missing_metadata.extend(missing);
+            }
+            _ => {}
+        }
+    }
+
+    stats.tx_missing_ordering_metadata = missing_metadata.len();
+    stats
+}
+
+fn compact_component_balances_for_retention(
+    balances: &mut Vec<ComponentBalance>,
+    tx_ordering: &HashMap<TxHash, TxOrdering>,
+    retention_horizon: NaiveDateTime,
+    apply: bool,
+) -> (usize, usize, HashSet<TxHash>) {
+    let raw = balances.len();
+    let mut missing_metadata = HashSet::new();
+    let mut by_key: HashMap<(ComponentId, Address), Vec<usize>> = HashMap::new();
+
+    for (idx, balance) in balances.iter().enumerate() {
+        by_key
+            .entry((balance.component_id.clone(), balance.token.clone()))
+            .or_default()
+            .push(idx);
+        if !tx_ordering.contains_key(&balance.modify_tx) {
+            missing_metadata.insert(balance.modify_tx.clone());
+        }
+    }
+
+    let mut drop_indices = HashSet::new();
+    for indices in by_key.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        if indices
+            .iter()
+            .any(|idx| !tx_ordering.contains_key(&balances[*idx].modify_tx))
+        {
+            continue;
+        }
+
+        let mut ordered = indices.clone();
+        ordered.sort_by_key(|idx| {
+            tx_ordering
+                .get(&balances[*idx].modify_tx)
+                .expect("metadata checked")
+                .sort_key()
+        });
+
+        for pair in ordered.windows(2) {
+            let current = pair[0];
+            let next = pair[1];
+            let next_ordering = tx_ordering
+                .get(&balances[next].modify_tx)
+                .expect("metadata checked");
+            if next_ordering.block_ts <= retention_horizon {
+                drop_indices.insert(current);
+            }
+        }
+    }
+
+    let compacted = drop_indices.len();
+    if apply && compacted > 0 {
+        let mut idx = 0usize;
+        balances.retain(|_| {
+            let keep = !drop_indices.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+
+    (raw, compacted, missing_metadata)
+}
+
+fn compact_protocol_state_for_retention(
+    deltas: &mut Vec<(TxHash, ProtocolComponentStateDelta)>,
+    tx_ordering: &HashMap<TxHash, TxOrdering>,
+    retention_horizon: NaiveDateTime,
+    apply: bool,
+) -> (usize, usize, usize, usize, HashSet<TxHash>) {
+    let mut raw = 0usize;
+    let mut deleted = 0usize;
+    let mut missing_metadata = HashSet::new();
+    let mut by_key: HashMap<(ComponentId, String), Vec<(usize, String)>> = HashMap::new();
+    let mut deletion_keys = HashSet::new();
+
+    for (delta_idx, (tx, delta)) in deltas.iter().enumerate() {
+        if !tx_ordering.contains_key(tx) {
+            missing_metadata.insert(tx.clone());
+        }
+        for attr in delta.updated_attributes.keys() {
+            raw += 1;
+            by_key
+                .entry((delta.component_id.clone(), attr.clone()))
+                .or_default()
+                .push((delta_idx, attr.clone()));
+        }
+        for attr in &delta.deleted_attributes {
+            deleted += 1;
+            deletion_keys.insert((delta.component_id.clone(), attr.clone()));
+        }
+    }
+
+    let mut drop_attrs: HashSet<(usize, String)> = HashSet::new();
+    let mut blocked_by_deletions = 0usize;
+    for (key, occurrences) in by_key.iter() {
+        if occurrences.len() < 2 {
+            continue;
+        }
+        if deletion_keys.contains(key) {
+            blocked_by_deletions += occurrences.len();
+            continue;
+        }
+        if occurrences
+            .iter()
+            .any(|(idx, _)| !tx_ordering.contains_key(&deltas[*idx].0))
+        {
+            continue;
+        }
+
+        let mut ordered = occurrences.clone();
+        ordered.sort_by_key(|(idx, _)| {
+            tx_ordering
+                .get(&deltas[*idx].0)
+                .expect("metadata checked")
+                .sort_key()
+        });
+
+        for pair in ordered.windows(2) {
+            let current = &pair[0];
+            let next = &pair[1];
+            let next_ordering = tx_ordering
+                .get(&deltas[next.0].0)
+                .expect("metadata checked");
+            if next_ordering.block_ts <= retention_horizon {
+                drop_attrs.insert(current.clone());
+            }
+        }
+    }
+
+    let compacted = drop_attrs.len();
+    if apply && compacted > 0 {
+        for (delta_idx, (_, delta)) in deltas.iter_mut().enumerate() {
+            delta
+                .updated_attributes
+                .retain(|attr, _| !drop_attrs.contains(&(delta_idx, attr.clone())));
+        }
+        deltas.retain(|(_, delta)| {
+            !delta.updated_attributes.is_empty() || !delta.deleted_attributes.is_empty()
+        });
+    }
+
+    (raw, compacted, deleted, blocked_by_deletions, missing_metadata)
+}
+
+fn filter_upsert_txs(ops: &mut [WriteOp], required: &HashSet<TxHash>) -> usize {
+    let mut dropped = 0usize;
+    for op in ops {
+        if let WriteOp::UpsertTx(txs) = op {
+            let before = txs.len();
+            txs.retain(|tx| required.contains(&tx.hash));
+            dropped += before - txs.len();
+        }
+    }
+    dropped
+}
+
+fn apply_batch_tx_optimization(
+    ops: &mut [WriteOp],
+    retention_horizon: NaiveDateTime,
+    config: BatchTxOptimizationConfig,
+) -> BatchTxOptimizationStats {
+    let tx_rows_total = count_upsert_tx_rows(ops);
+    let upsert_tx_hashes = collect_tx_hashes_in_upsert_tx(ops);
+    let tx_ordering = collect_tx_ordering(ops);
+    let tx_required_raw = collect_required_tx_hashes(ops);
+    let tx_required_missing_from_batch_raw = tx_required_raw
+        .difference(&upsert_tx_hashes)
+        .count();
+    let tx_rows_droppable_raw = count_droppable_upsert_tx_rows(ops, &tx_required_raw);
+
+    let mut compacted_ops = ops.to_vec();
+    let compaction_stats = compact_protocol_writes_for_retention(
+        &mut compacted_ops,
+        &tx_ordering,
+        retention_horizon,
+        true,
+    );
+    let tx_required_after_compaction = collect_required_tx_hashes(&compacted_ops);
+    let tx_rows_droppable_after_compaction =
+        count_droppable_upsert_tx_rows(&compacted_ops, &tx_required_after_compaction);
+    let tx_required_missing_from_batch_after_compaction = tx_required_after_compaction
+        .difference(&upsert_tx_hashes)
+        .count();
+
+    let tx_rows_dropped = if config.filters_transactions() {
+        let required = if config.retention_compact_protocol_writes {
+            &tx_required_after_compaction
+        } else {
+            &tx_required_raw
+        };
+        filter_upsert_txs(ops, required)
+    } else {
+        0
+    };
+
+    BatchTxOptimizationStats {
+        tx_rows_total,
+        tx_rows_unique: upsert_tx_hashes.len(),
+        tx_rows_kept: tx_rows_total.saturating_sub(tx_rows_dropped),
+        tx_rows_dropped,
+        tx_rows_droppable_raw,
+        tx_rows_droppable_after_compaction,
+        tx_required_raw: tx_required_raw.len(),
+        tx_required_after_compaction: tx_required_after_compaction.len(),
+        tx_required_missing_from_batch_raw,
+        tx_required_missing_from_batch_after_compaction,
+        tx_missing_ordering_metadata: compaction_stats.tx_missing_ordering_metadata,
+        component_balance_rows_raw: compaction_stats.component_balance_rows_raw,
+        component_balance_rows_compacted: compaction_stats.component_balance_rows_compacted,
+        protocol_state_updated_attrs_raw: compaction_stats.protocol_state_updated_attrs_raw,
+        protocol_state_updated_attrs_compacted: compaction_stats
+            .protocol_state_updated_attrs_compacted,
+        protocol_state_deleted_attrs: compaction_stats.protocol_state_deleted_attrs,
+        protocol_state_compaction_blocked_by_deletions: compaction_stats
+            .protocol_state_compaction_blocked_by_deletions,
+    }
+}
+
+fn collect_light_batch_tx_stats(ops: &[WriteOp]) -> BatchTxOptimizationStats {
+    let tx_rows_total = count_upsert_tx_rows(ops);
+    let upsert_tx_hashes = collect_tx_hashes_in_upsert_tx(ops);
+    let tx_required_raw = collect_required_tx_hashes(ops);
+    let tx_required_missing_from_batch_raw = tx_required_raw
+        .difference(&upsert_tx_hashes)
+        .count();
+
+    BatchTxOptimizationStats {
+        tx_rows_total,
+        tx_rows_unique: upsert_tx_hashes.len(),
+        tx_rows_kept: tx_rows_total,
+        tx_required_raw: tx_required_raw.len(),
+        tx_required_after_compaction: tx_required_raw.len(),
+        tx_required_missing_from_batch_raw,
+        tx_required_missing_from_batch_after_compaction: tx_required_missing_from_batch_raw,
+        ..Default::default()
     }
 }
 
@@ -312,6 +892,7 @@ pub(crate) struct DBCacheWriteExecutor {
     state_gateway: PostgresGateway,
     persisted_block: Option<models::blockchain::Block>,
     msg_receiver: mpsc::Receiver<DBCacheMessage>,
+    batch_tx_optimization_config: BatchTxOptimizationConfig,
 }
 
 impl DBCacheWriteExecutor {
@@ -334,7 +915,38 @@ impl DBCacheWriteExecutor {
 
         debug!("Persisted block: {:?}", persisted_block);
 
-        Self { name, chain, pool, state_gateway, persisted_block, msg_receiver }
+        let batch_tx_optimization_config = BatchTxOptimizationConfig::from_env();
+        info!(
+            name = name.as_str(),
+            mode = batch_tx_optimization_config.mode_name(),
+            write_only_referenced_txs = batch_tx_optimization_config.write_only_referenced_txs,
+            retention_compact_protocol_writes =
+                batch_tx_optimization_config.retention_compact_protocol_writes,
+            log_projection_stats = batch_tx_optimization_config.logs_projection_stats(),
+            "BatchTxOptimizationConfig"
+        );
+        if batch_tx_optimization_config.retention_compact_protocol_writes {
+            warn!(
+                "TYCHO_EXPERIMENTAL_RETENTION_COMPACT_PROTOCOL_WRITES is enabled; protocol writes \
+                 will be planned through partitioned versioning before transaction rows are filtered"
+            );
+        }
+        if batch_tx_optimization_config.write_only_referenced_txs {
+            warn!(
+                "TYCHO_WRITE_ONLY_REFERENCED_TXS is observe-only in this build; same-batch-only \
+                 transaction filtering is unsafe for cross-batch synthetic transaction references"
+            );
+        }
+
+        Self {
+            name,
+            chain,
+            pool,
+            state_gateway,
+            persisted_block,
+            msg_receiver,
+            batch_tx_optimization_config,
+        }
     }
 
     /// Spawns a task to process incoming database messages (write requests or flush commands).
@@ -353,11 +965,31 @@ impl DBCacheWriteExecutor {
     }
 
     #[instrument(name="db_write", skip_all, fields(block_range = %new_db_tx.block_range, extractor_id = tracing::field::Empty))]
-    async fn write(&mut self, new_db_tx: DBTransaction) {
+    async fn write(&mut self, mut new_db_tx: DBTransaction) {
         tracing::Span::current().follows_from(new_db_tx.caller_span.id());
         debug!("NewDBTransactionStart");
         if let Some(extractor_id) = new_db_tx.owner.as_ref() {
             tracing::Span::current().record("extractor_id", extractor_id);
+        }
+
+        if self.batch_tx_optimization_config.logs_projection_stats() {
+            let optimization_stats = apply_batch_tx_optimization(
+                &mut new_db_tx.operations,
+                self.state_gateway.retention_horizon(),
+                self.batch_tx_optimization_config,
+            );
+            optimization_stats.log(
+                self.batch_tx_optimization_config,
+                &new_db_tx.block_range,
+                self.state_gateway.retention_horizon(),
+            );
+        } else {
+            let optimization_stats = collect_light_batch_tx_stats(&new_db_tx.operations);
+            optimization_stats.log(
+                self.batch_tx_optimization_config,
+                &new_db_tx.block_range,
+                self.state_gateway.retention_horizon(),
+            );
         }
 
         let mut conn = self
@@ -377,24 +1009,8 @@ impl DBCacheWriteExecutor {
                 .repeatable_read()
                 .run(|conn| {
                     async {
-                        for op in new_db_tx.operations.iter() {
-                            match self.execute_write_op(op, conn).await {
-                                Err(PostgresError(StorageError::DuplicateEntry(entity, id))) => {
-                                    // As this db transaction is old. It can contain
-                                    // already stored txs, we log the duplicate entry
-                                    // error and continue
-                                    debug!(
-                                        "Ignoring duplicate entry for {} with id {}",
-                                        entity, id
-                                    );
-                                }
-                                Err(e) => {
-                                    return Err(e);
-                                }
-                                _ => {}
-                            }
-                        }
-                        Result::<(), PostgresError>::Ok(())
+                        self.execute_write_ops(&new_db_tx.operations, conn).await?;
+                        Ok(())
                     }
                     .scope_boxed()
                 })
@@ -450,6 +1066,207 @@ impl DBCacheWriteExecutor {
     ///
     /// This function handles different types of write operations such as
     /// upserts, updates, and reverts, ensuring data consistency in the database.
+    async fn execute_write_ops(
+        &mut self,
+        operations: &[WriteOp],
+        conn: &mut AsyncPgConnection,
+    ) -> Result<(), PostgresError> {
+        if self.batch_tx_optimization_config.retention_compact_protocol_writes
+            && has_protocol_versioned_writes(operations)
+        {
+            self.execute_retention_aware_protocol_write_ops(operations, conn)
+                .await
+        } else {
+            for op in operations {
+                self.execute_write_op_allowing_duplicates(op, conn).await?;
+            }
+            Ok(())
+        }
+    }
+
+    async fn execute_write_op_allowing_duplicates(
+        &mut self,
+        operation: &WriteOp,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<(), PostgresError> {
+        match self.execute_write_op(operation, conn).await {
+            Err(PostgresError(StorageError::DuplicateEntry(entity, id))) => {
+                // As this db transaction is old. It can contain already stored txs, we log the
+                // duplicate entry error and continue.
+                debug!("Ignoring duplicate entry for {} with id {}", entity, id);
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    async fn upsert_required_txs(
+        &mut self,
+        operations: &[WriteOp],
+        required: &HashSet<TxHash>,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<usize, PostgresError> {
+        if required.is_empty() {
+            return Ok(0);
+        }
+
+        let txs = operations
+            .iter()
+            .filter_map(|op| match op {
+                WriteOp::UpsertTx(txs) => Some(txs.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|tx| required.contains(&tx.hash))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if txs.is_empty() {
+            return Ok(0);
+        }
+
+        self.state_gateway
+            .upsert_tx(&txs, conn)
+            .await?;
+        Ok(txs.len())
+    }
+
+    async fn execute_retention_aware_protocol_write_ops(
+        &mut self,
+        operations: &[WriteOp],
+        conn: &mut AsyncPgConnection,
+    ) -> Result<(), PostgresError> {
+        let tx_metadata = collect_protocol_tx_metadata(operations);
+        let upfront_required_txs = collect_upfront_required_tx_hashes(operations);
+
+        let mut upfront_tx_rows = 0usize;
+        for op in operations {
+            match op {
+                WriteOp::UpsertTx(_) => {
+                    upfront_tx_rows += self
+                        .upsert_required_txs(operations, &upfront_required_txs, conn)
+                        .await?;
+                }
+                WriteOp::InsertComponentBalances(_) | WriteOp::UpsertProtocolState(_) => {}
+                _ if op.order_key() < WriteOp::InsertComponentBalances(Vec::new()).order_key() => {
+                    self.execute_write_op_allowing_duplicates(op, conn).await?;
+                }
+                _ => {}
+            }
+        }
+
+        let raw_protocol_txs = collect_protocol_write_tx_hashes(operations);
+        let all_upsert_txs = collect_tx_hashes_in_upsert_tx(operations);
+        let mut retained_required_txs = HashSet::new();
+        let inserted_tx_hashes = upfront_required_txs.clone();
+        let mut component_balance_plan = None;
+        let mut protocol_state_plan = None;
+        let mut raw_component_balance_rows = 0usize;
+        let mut retained_component_balance_rows = 0usize;
+        let mut raw_protocol_state_attrs = 0usize;
+        let mut raw_protocol_state_deleted_attrs = 0usize;
+        let mut retained_protocol_state_rows = 0usize;
+
+        for op in operations {
+            match op {
+                WriteOp::InsertComponentBalances(balances) if !balances.is_empty() => {
+                    let plan = self
+                        .state_gateway
+                        .plan_retained_component_balances(
+                            balances.as_slice(),
+                            &self.chain,
+                            &tx_metadata,
+                            conn,
+                        )
+                        .await?;
+                    retained_required_txs.extend(plan.required_tx_hashes());
+                    raw_component_balance_rows += plan.raw_rows;
+                    retained_component_balance_rows += plan.retained_rows();
+                    component_balance_plan = Some(plan);
+                }
+                WriteOp::UpsertProtocolState(deltas) if !deltas.is_empty() => {
+                    let collected_changes = deltas
+                        .iter()
+                        .map(|(tx, update)| (tx.clone(), update))
+                        .collect::<Vec<_>>();
+                    let plan = self
+                        .state_gateway
+                        .plan_retained_protocol_states(
+                            &self.chain,
+                            collected_changes.as_slice(),
+                            &tx_metadata,
+                            conn,
+                        )
+                        .await?;
+                    retained_required_txs.extend(plan.required_tx_hashes());
+                    raw_protocol_state_attrs += plan.raw_updated_attrs;
+                    raw_protocol_state_deleted_attrs += plan.raw_deleted_attrs;
+                    retained_protocol_state_rows += plan.retained_rows();
+                    protocol_state_plan = Some(plan);
+                }
+                _ => {}
+            }
+        }
+
+        let discarded_protocol_txs = raw_protocol_txs
+            .difference(&retained_required_txs)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut txs_to_keep = all_upsert_txs
+            .difference(&discarded_protocol_txs)
+            .cloned()
+            .collect::<HashSet<_>>();
+        txs_to_keep.extend(upfront_required_txs.iter().cloned());
+        let post_plan_required = txs_to_keep
+            .difference(&inserted_tx_hashes)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let post_plan_tx_rows_upserted = self
+            .upsert_required_txs(operations, &post_plan_required, conn)
+            .await?;
+
+        if let Some(plan) = component_balance_plan {
+            self.state_gateway
+                .insert_retained_component_balances(&plan, conn)
+                .await?;
+        }
+
+        if let Some(plan) = protocol_state_plan {
+            self.state_gateway
+                .insert_retained_protocol_states(&plan, conn)
+                .await?;
+        }
+
+        for op in operations
+            .iter()
+            .filter(|op| op.order_key() > WriteOp::UpsertProtocolState(Vec::new()).order_key())
+        {
+            self.execute_write_op_allowing_duplicates(op, conn).await?;
+        }
+
+        let retained_tx_rows = upfront_required_txs
+            .union(&retained_required_txs)
+            .count();
+        debug!(
+            mode = "retention_aware_protocol_writes",
+            upfront_tx_rows,
+            post_plan_tx_rows_upserted,
+            retained_tx_rows,
+            tx_rows_total = count_upsert_tx_rows(operations),
+            tx_rows_kept = txs_to_keep.len(),
+            tx_rows_dropped = count_upsert_tx_rows(operations).saturating_sub(txs_to_keep.len()),
+            discarded_protocol_tx_count = discarded_protocol_txs.len(),
+            raw_component_balance_rows,
+            retained_component_balance_rows,
+            raw_protocol_state_attrs,
+            raw_protocol_state_deleted_attrs,
+            retained_protocol_state_rows,
+            "RetainedProtocolWriteStats"
+        );
+
+        Ok(())
+    }
+
     #[instrument(skip_all, fields(op=operation.variant_name()))]
     async fn execute_write_op(
         &mut self,
@@ -1282,6 +2099,338 @@ mod test_serial_db {
 
     use super::*;
     use crate::postgres::{db_fixtures, db_fixtures::yesterday_one_am, testing::run_against_db};
+
+    fn fixed_ts(day: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2023, 1, day)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+    }
+
+    fn test_block(number: u64, hash: &str, ts: NaiveDateTime) -> models::blockchain::Block {
+        models::blockchain::Block::new(
+            number,
+            Chain::Ethereum,
+            Bytes::from(hash),
+            Bytes::default(),
+            ts,
+        )
+    }
+
+    fn test_tx(
+        hash: &str,
+        block: &models::blockchain::Block,
+        index: u64,
+    ) -> models::blockchain::Transaction {
+        models::blockchain::Transaction {
+            hash: Bytes::from(hash),
+            block_hash: block.hash.clone(),
+            from: Bytes::zero(20),
+            to: Some(Bytes::zero(20)),
+            index,
+        }
+    }
+
+    fn retention_compaction_config() -> BatchTxOptimizationConfig {
+        BatchTxOptimizationConfig {
+            write_only_referenced_txs: false,
+            retention_compact_protocol_writes: true,
+        }
+    }
+
+    fn observe_config() -> BatchTxOptimizationConfig {
+        BatchTxOptimizationConfig {
+            write_only_referenced_txs: false,
+            retention_compact_protocol_writes: false,
+        }
+    }
+
+    #[test]
+    fn observe_mode_reports_retention_candidates_without_mutating_ops() {
+        let block_1 = test_block(
+            1,
+            "0x0800000000000000000000000000000000000000000000000000000000000000",
+            fixed_ts(1),
+        );
+        let block_2 = test_block(
+            2,
+            "0x0900000000000000000000000000000000000000000000000000000000000000",
+            fixed_ts(2),
+        );
+        let tx_1 = test_tx(
+            "0x8800000000000000000000000000000000000000000000000000000000000000",
+            &block_1,
+            1,
+        );
+        let tx_2 = test_tx(
+            "0x9900000000000000000000000000000000000000000000000000000000000000",
+            &block_2,
+            1,
+        );
+        let component_id = "pool-observe".to_string();
+        let mut ops = vec![
+            WriteOp::UpsertBlock(vec![block_1, block_2]),
+            WriteOp::UpsertTx(vec![tx_1.clone(), tx_2.clone()]),
+            WriteOp::UpsertProtocolState(vec![
+                (
+                    tx_1.hash.clone(),
+                    ProtocolComponentStateDelta::new(
+                        &component_id,
+                        HashMap::from([("reserve0".to_string(), Bytes::from(1_u64).lpad(32, 0))]),
+                        HashSet::new(),
+                    ),
+                ),
+                (
+                    tx_2.hash.clone(),
+                    ProtocolComponentStateDelta::new(
+                        &component_id,
+                        HashMap::from([("reserve0".to_string(), Bytes::from(2_u64).lpad(32, 0))]),
+                        HashSet::new(),
+                    ),
+                ),
+            ]),
+        ];
+        let original_ops = ops.clone();
+
+        let stats = apply_batch_tx_optimization(&mut ops, fixed_ts(10), observe_config());
+
+        assert_eq!(ops, original_ops);
+        assert_eq!(stats.tx_rows_dropped, 0);
+        assert_eq!(stats.tx_rows_droppable_raw, 0);
+        assert_eq!(stats.tx_rows_droppable_after_compaction, 1);
+        assert_eq!(stats.protocol_state_updated_attrs_compacted, 1);
+        assert_eq!(stats.tx_required_raw, 2);
+        assert_eq!(stats.tx_required_after_compaction, 1);
+    }
+
+    #[test]
+    fn retention_compaction_stats_do_not_mutate_ops() {
+        let block_1 = test_block(
+            1,
+            "0x0100000000000000000000000000000000000000000000000000000000000000",
+            fixed_ts(1),
+        );
+        let block_2 = test_block(
+            2,
+            "0x0200000000000000000000000000000000000000000000000000000000000000",
+            fixed_ts(2),
+        );
+        let tx_1 = test_tx(
+            "0x1100000000000000000000000000000000000000000000000000000000000000",
+            &block_1,
+            1,
+        );
+        let tx_2 = test_tx(
+            "0x2200000000000000000000000000000000000000000000000000000000000000",
+            &block_2,
+            1,
+        );
+        let token = Bytes::from("0x0000000000000000000000000000000000000001");
+        let component_id = "pool-1".to_string();
+
+        let mut ops = vec![
+            WriteOp::UpsertBlock(vec![block_1, block_2]),
+            WriteOp::UpsertTx(vec![tx_1.clone(), tx_2.clone()]),
+            WriteOp::InsertComponentBalances(vec![
+                ComponentBalance::new(
+                    token.clone(),
+                    Bytes::from(1_u64).lpad(32, 0),
+                    1.0,
+                    tx_1.hash.clone(),
+                    &component_id,
+                ),
+                ComponentBalance::new(
+                    token,
+                    Bytes::from(2_u64).lpad(32, 0),
+                    2.0,
+                    tx_2.hash.clone(),
+                    &component_id,
+                ),
+            ]),
+            WriteOp::UpsertProtocolState(vec![
+                (
+                    tx_1.hash.clone(),
+                    ProtocolComponentStateDelta::new(
+                        &component_id,
+                        HashMap::from([("reserve0".to_string(), Bytes::from(1_u64).lpad(32, 0))]),
+                        HashSet::new(),
+                    ),
+                ),
+                (
+                    tx_2.hash.clone(),
+                    ProtocolComponentStateDelta::new(
+                        &component_id,
+                        HashMap::from([("reserve0".to_string(), Bytes::from(2_u64).lpad(32, 0))]),
+                        HashSet::new(),
+                    ),
+                ),
+            ]),
+        ];
+
+        let original_ops = ops.clone();
+        let stats =
+            apply_batch_tx_optimization(&mut ops, fixed_ts(10), retention_compaction_config());
+
+        assert_eq!(stats.component_balance_rows_compacted, 1);
+        assert_eq!(stats.protocol_state_updated_attrs_compacted, 1);
+        assert_eq!(stats.tx_rows_dropped, 0);
+        assert_eq!(stats.tx_rows_droppable_raw, 0);
+        assert_eq!(stats.tx_rows_droppable_after_compaction, 1);
+        assert_eq!(stats.tx_required_after_compaction, 1);
+        assert_eq!(ops, original_ops);
+    }
+
+    #[test]
+    fn retention_compaction_preserves_protocol_component_creation_tx() {
+        let block_1 = test_block(
+            1,
+            "0x0300000000000000000000000000000000000000000000000000000000000000",
+            fixed_ts(1),
+        );
+        let block_2 = test_block(
+            2,
+            "0x0400000000000000000000000000000000000000000000000000000000000000",
+            fixed_ts(2),
+        );
+        let tx_1 = test_tx(
+            "0x3300000000000000000000000000000000000000000000000000000000000000",
+            &block_1,
+            1,
+        );
+        let tx_2 = test_tx(
+            "0x4400000000000000000000000000000000000000000000000000000000000000",
+            &block_2,
+            1,
+        );
+        let component_id = "pool-creation".to_string();
+
+        let mut ops = vec![
+            WriteOp::UpsertBlock(vec![block_1, block_2]),
+            WriteOp::UpsertTx(vec![tx_1.clone(), tx_2.clone()]),
+            WriteOp::InsertProtocolComponents(vec![ProtocolComponent {
+                id: component_id.clone(),
+                protocol_system: "ambient".to_string(),
+                protocol_type_name: "ambient_pool".to_string(),
+                chain: Chain::Ethereum,
+                tokens: vec![],
+                contract_addresses: vec![],
+                static_attributes: HashMap::new(),
+                change: ChangeType::Creation,
+                creation_tx: tx_1.hash.clone(),
+                created_at: fixed_ts(1),
+            }]),
+            WriteOp::UpsertProtocolState(vec![
+                (
+                    tx_1.hash.clone(),
+                    ProtocolComponentStateDelta::new(
+                        &component_id,
+                        HashMap::from([("reserve0".to_string(), Bytes::from(1_u64).lpad(32, 0))]),
+                        HashSet::new(),
+                    ),
+                ),
+                (
+                    tx_2.hash.clone(),
+                    ProtocolComponentStateDelta::new(
+                        &component_id,
+                        HashMap::from([("reserve0".to_string(), Bytes::from(2_u64).lpad(32, 0))]),
+                        HashSet::new(),
+                    ),
+                ),
+            ]),
+        ];
+
+        let stats =
+            apply_batch_tx_optimization(&mut ops, fixed_ts(10), retention_compaction_config());
+
+        assert_eq!(stats.protocol_state_updated_attrs_compacted, 1);
+        assert_eq!(stats.tx_rows_dropped, 0);
+        assert_eq!(stats.tx_rows_droppable_after_compaction, 0);
+        assert_eq!(stats.tx_required_after_compaction, 2);
+
+        let WriteOp::UpsertTx(txs) = &ops[1] else {
+            panic!("expected UpsertTx");
+        };
+        assert_eq!(txs, &vec![tx_1, tx_2]);
+    }
+
+    #[test]
+    fn retention_compaction_does_not_cross_protocol_state_deletions() {
+        let block_1 = test_block(
+            1,
+            "0x0500000000000000000000000000000000000000000000000000000000000000",
+            fixed_ts(1),
+        );
+        let block_2 = test_block(
+            2,
+            "0x0600000000000000000000000000000000000000000000000000000000000000",
+            fixed_ts(2),
+        );
+        let block_3 = test_block(
+            3,
+            "0x0700000000000000000000000000000000000000000000000000000000000000",
+            fixed_ts(3),
+        );
+        let tx_1 = test_tx(
+            "0x5500000000000000000000000000000000000000000000000000000000000000",
+            &block_1,
+            1,
+        );
+        let tx_2 = test_tx(
+            "0x6600000000000000000000000000000000000000000000000000000000000000",
+            &block_2,
+            1,
+        );
+        let tx_3 = test_tx(
+            "0x7700000000000000000000000000000000000000000000000000000000000000",
+            &block_3,
+            1,
+        );
+        let component_id = "pool-deletion".to_string();
+
+        let mut ops = vec![
+            WriteOp::UpsertBlock(vec![block_1, block_2, block_3]),
+            WriteOp::UpsertTx(vec![tx_1.clone(), tx_2.clone(), tx_3.clone()]),
+            WriteOp::UpsertProtocolState(vec![
+                (
+                    tx_1.hash.clone(),
+                    ProtocolComponentStateDelta::new(
+                        &component_id,
+                        HashMap::from([("reserve0".to_string(), Bytes::from(1_u64).lpad(32, 0))]),
+                        HashSet::new(),
+                    ),
+                ),
+                (
+                    tx_2.hash.clone(),
+                    ProtocolComponentStateDelta::new(
+                        &component_id,
+                        HashMap::new(),
+                        HashSet::from(["reserve0".to_string()]),
+                    ),
+                ),
+                (
+                    tx_3.hash.clone(),
+                    ProtocolComponentStateDelta::new(
+                        &component_id,
+                        HashMap::from([("reserve0".to_string(), Bytes::from(3_u64).lpad(32, 0))]),
+                        HashSet::new(),
+                    ),
+                ),
+            ]),
+        ];
+
+        let stats =
+            apply_batch_tx_optimization(&mut ops, fixed_ts(10), retention_compaction_config());
+
+        assert_eq!(stats.protocol_state_updated_attrs_compacted, 0);
+        assert_eq!(stats.protocol_state_deleted_attrs, 1);
+        assert_eq!(stats.protocol_state_compaction_blocked_by_deletions, 2);
+        assert_eq!(stats.tx_rows_dropped, 0);
+
+        let WriteOp::UpsertProtocolState(deltas) = &ops[2] else {
+            panic!("expected UpsertProtocolState");
+        };
+        assert_eq!(deltas.len(), 3);
+    }
 
     #[tokio::test]
     async fn test_write_and_flush() {

@@ -39,7 +39,7 @@ pub enum Command {
     /// Starts a job to analyze stored tokens for tax and gas cost.
     AnalyzeTokens(AnalyzeTokenArgs),
     /// Starts Tycho RPC only. No extractors.
-    Rpc,
+    Rpc(RpcOnlyArgs),
 }
 
 #[derive(Parser, Debug, Clone, PartialEq)]
@@ -277,6 +277,13 @@ pub struct AnalyzeTokenArgs {
     pub fetch_batch_size: usize,
 }
 
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct RpcOnlyArgs {
+    /// Blockchains to serve through Tycho RPC.
+    #[clap(long, default_value = "ethereum", value_delimiter = ',')]
+    pub chains: Vec<Chain>,
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -349,6 +356,23 @@ mod cli_tests {
         };
 
         assert_eq!(cli, expected_args);
+    }
+
+    #[test]
+    fn test_arg_parsing_rpc_cmd_with_robinhood() {
+        let cli = Cli::try_parse_from(vec![
+            "tycho-indexer",
+            "--database-url",
+            "my_db",
+            "--rpc-url",
+            "http://example.com",
+            "rpc",
+            "--chains",
+            "robinhood",
+        ])
+        .expect("parse errored");
+
+        assert_eq!(cli.command(), Command::Rpc(RpcOnlyArgs { chains: vec![Chain::Robinhood] }));
     }
 
     #[tokio::test]

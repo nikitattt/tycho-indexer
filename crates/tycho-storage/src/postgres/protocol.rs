@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use chrono::{NaiveDateTime, Utc};
 use diesel::{
     prelude::*,
+    sql_types::{Array, BigInt, Binary, Jsonb, Nullable, Text, Timestamptz},
     upsert::{excluded, on_constraint},
 };
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -25,9 +26,346 @@ use tycho_common::{
 use super::{
     maybe_lookup_block_ts, maybe_lookup_version_ts, orm, schema, storage_error_from_diesel,
     truncate_to_byte_limit,
-    versioning::{apply_partitioned_versioning, VersioningEntry},
+    versioning::{apply_partitioned_versioning, PartitionedVersionedRow, VersioningEntry},
     PostgresError, PostgresGateway, WithOrdinal, WithTxHash, MAX_TS, MAX_VERSION_TS,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProtocolTxMetadata {
+    pub index: u64,
+    pub ts: NaiveDateTime,
+}
+
+#[derive(QueryableByName)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+struct FullProtocolComponentRow {
+    #[diesel(sql_type = Text)]
+    external_id: String,
+    #[diesel(sql_type = Nullable<Jsonb>)]
+    attributes: Option<serde_json::Value>,
+    #[diesel(sql_type = Timestamptz)]
+    created_at: NaiveDateTime,
+    #[diesel(sql_type = Binary)]
+    creation_tx: TxHash,
+    #[diesel(sql_type = Text)]
+    protocol_system: String,
+    #[diesel(sql_type = Text)]
+    protocol_type_name: String,
+    #[diesel(sql_type = Array<Binary>)]
+    token_addresses: Vec<Address>,
+    #[diesel(sql_type = Array<Binary>)]
+    contract_addresses: Vec<Address>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PlannedTxRef {
+    Existing(i64),
+    Batch(TxHash),
+}
+
+impl PlannedTxRef {
+    fn batch_hash(&self) -> Option<&TxHash> {
+        match self {
+            PlannedTxRef::Existing(_) => None,
+            PlannedTxRef::Batch(hash) => Some(hash),
+        }
+    }
+
+    fn resolve(&self, tx_ids: &HashMap<TxHash, i64>) -> Result<i64, StorageError> {
+        match self {
+            PlannedTxRef::Existing(id) => Ok(*id),
+            PlannedTxRef::Batch(hash) => tx_ids
+                .get(hash)
+                .copied()
+                .ok_or_else(|| StorageError::NotFound("Transaction".to_string(), hash.to_string())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PlannedComponentBalance {
+    token_id: i64,
+    new_balance: Balance,
+    previous_value: Balance,
+    balance_float: f64,
+    modify_tx: PlannedTxRef,
+    protocol_component_id: i64,
+    valid_from: NaiveDateTime,
+    valid_to: NaiveDateTime,
+}
+
+impl PlannedComponentBalance {
+    fn new(
+        token_id: i64,
+        new_balance: Balance,
+        balance_float: f64,
+        modify_tx: TxHash,
+        protocol_component_id: i64,
+        valid_from: NaiveDateTime,
+    ) -> Self {
+        Self {
+            token_id,
+            new_balance,
+            previous_value: Bytes::from("0x00"),
+            balance_float,
+            modify_tx: PlannedTxRef::Batch(modify_tx),
+            protocol_component_id,
+            valid_from,
+            valid_to: MAX_TS,
+        }
+    }
+
+    fn from_db_row(value: orm::ComponentBalance) -> Self {
+        Self {
+            token_id: value.token_id,
+            new_balance: value.new_balance,
+            previous_value: value.previous_value,
+            balance_float: value.balance_float,
+            modify_tx: PlannedTxRef::Existing(value.modify_tx),
+            protocol_component_id: value.protocol_component_id,
+            valid_from: value.valid_from,
+            valid_to: value.valid_to,
+        }
+    }
+
+    fn batch_tx_hash(&self) -> Option<&TxHash> {
+        self.modify_tx.batch_hash()
+    }
+
+    fn resolve(
+        &self,
+        tx_ids: &HashMap<TxHash, i64>,
+    ) -> Result<orm::NewComponentBalance, StorageError> {
+        Ok(orm::NewComponentBalance {
+            token_id: self.token_id,
+            new_balance: self.new_balance.clone(),
+            previous_value: self.previous_value.clone(),
+            balance_float: self.balance_float,
+            modify_tx: self.modify_tx.resolve(tx_ids)?,
+            protocol_component_id: self.protocol_component_id,
+            valid_from: self.valid_from,
+            valid_to: self.valid_to,
+        })
+    }
+}
+
+impl PartitionedVersionedRow for PlannedComponentBalance {
+    type EntityId = (i64, i64);
+
+    fn get_id(&self) -> Self::EntityId {
+        (self.protocol_component_id, self.token_id)
+    }
+
+    fn get_valid_to(&self) -> NaiveDateTime {
+        self.valid_to
+    }
+
+    fn get_valid_from(&self) -> NaiveDateTime {
+        self.valid_from
+    }
+
+    fn archive(&mut self, next_version: &mut Self) {
+        next_version.previous_value = self.new_balance.clone();
+        self.valid_to = next_version.valid_from;
+    }
+
+    fn delete(&mut self, delete_version: NaiveDateTime) {
+        self.valid_to = delete_version;
+    }
+
+    async fn latest_versions_by_ids(
+        ids: Vec<Self::EntityId>,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<Vec<Self>, StorageError>
+    where
+        Self: Sized,
+    {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let (component_ids, token_ids): (Vec<_>, Vec<_>) = ids.into_iter().unzip();
+        let results: Vec<orm::ComponentBalance> = diesel::sql_query(
+            "SELECT cb.*
+             FROM component_balance_default cb
+             INNER JOIN unnest($1::bigint[], $2::bigint[]) AS pairs(comp_id, tok_id)
+               ON cb.protocol_component_id = pairs.comp_id
+               AND cb.token_id = pairs.tok_id",
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&component_ids)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&token_ids)
+        .load(conn)
+        .await
+        .map_err(PostgresError::from)?;
+
+        Ok(results
+            .into_iter()
+            .map(PlannedComponentBalance::from_db_row)
+            .collect())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PlannedProtocolState {
+    protocol_component_id: i64,
+    attribute_name: String,
+    attribute_value: Bytes,
+    previous_value: Option<Bytes>,
+    modify_tx: PlannedTxRef,
+    valid_from: NaiveDateTime,
+    valid_to: NaiveDateTime,
+}
+
+impl PlannedProtocolState {
+    fn new(
+        protocol_component_id: i64,
+        attribute_name: &str,
+        attribute_value: &Bytes,
+        modify_tx: TxHash,
+        valid_from: NaiveDateTime,
+    ) -> Self {
+        Self {
+            protocol_component_id,
+            attribute_name: attribute_name.to_string(),
+            attribute_value: attribute_value.clone(),
+            previous_value: None,
+            modify_tx: PlannedTxRef::Batch(modify_tx),
+            valid_from,
+            valid_to: MAX_TS,
+        }
+    }
+
+    fn from_db_row(value: orm::ProtocolState) -> Self {
+        Self {
+            protocol_component_id: value.protocol_component_id,
+            attribute_name: value.attribute_name,
+            attribute_value: value.attribute_value,
+            previous_value: value.previous_value,
+            modify_tx: PlannedTxRef::Existing(value.modify_tx),
+            valid_from: value.valid_from,
+            valid_to: value.valid_to,
+        }
+    }
+
+    fn batch_tx_hash(&self) -> Option<&TxHash> {
+        self.modify_tx.batch_hash()
+    }
+
+    fn resolve(
+        &self,
+        tx_ids: &HashMap<TxHash, i64>,
+    ) -> Result<orm::NewProtocolState, StorageError> {
+        Ok(orm::NewProtocolState {
+            protocol_component_id: self.protocol_component_id,
+            attribute_name: self.attribute_name.clone(),
+            attribute_value: self.attribute_value.clone(),
+            previous_value: self.previous_value.clone(),
+            modify_tx: self.modify_tx.resolve(tx_ids)?,
+            valid_from: self.valid_from,
+            valid_to: self.valid_to,
+        })
+    }
+}
+
+impl PartitionedVersionedRow for PlannedProtocolState {
+    type EntityId = (i64, String);
+
+    fn get_id(&self) -> Self::EntityId {
+        (self.protocol_component_id, self.attribute_name.clone())
+    }
+
+    fn get_valid_to(&self) -> NaiveDateTime {
+        self.valid_to
+    }
+
+    fn get_valid_from(&self) -> NaiveDateTime {
+        self.valid_from
+    }
+
+    fn archive(&mut self, next_version: &mut Self) {
+        next_version.previous_value = Some(self.attribute_value.clone());
+        self.valid_to = next_version.valid_from;
+    }
+
+    fn delete(&mut self, delete_version: NaiveDateTime) {
+        self.valid_to = delete_version;
+    }
+
+    async fn latest_versions_by_ids(
+        ids: Vec<Self::EntityId>,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<Vec<Self>, StorageError>
+    where
+        Self: Sized,
+    {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let (pc_ids, attr_names): (Vec<_>, Vec<_>) = ids.into_iter().unzip();
+        let results: Vec<orm::ProtocolState> = diesel::sql_query(
+            "SELECT ps.*
+             FROM protocol_state_default ps
+             INNER JOIN unnest($1::bigint[], $2::text[]) AS pairs(pc_id, attr_name)
+               ON ps.protocol_component_id = pairs.pc_id
+               AND ps.attribute_name = pairs.attr_name",
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&pc_ids)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&attr_names)
+        .load(conn)
+        .await
+        .map_err(PostgresError::from)?;
+
+        Ok(results
+            .into_iter()
+            .map(PlannedProtocolState::from_db_row)
+            .collect())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RetainedComponentBalanceWrites {
+    latest: Vec<PlannedComponentBalance>,
+    to_archive: Vec<PlannedComponentBalance>,
+    pub raw_rows: usize,
+}
+
+impl RetainedComponentBalanceWrites {
+    pub(crate) fn required_tx_hashes(&self) -> HashSet<TxHash> {
+        self.latest
+            .iter()
+            .chain(self.to_archive.iter())
+            .filter_map(|row| row.batch_tx_hash().cloned())
+            .collect()
+    }
+
+    pub(crate) fn retained_rows(&self) -> usize {
+        self.latest.len() + self.to_archive.len()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RetainedProtocolStateWrites {
+    latest: Vec<PlannedProtocolState>,
+    to_archive: Vec<PlannedProtocolState>,
+    to_delete: Vec<(i64, String)>,
+    pub raw_updated_attrs: usize,
+    pub raw_deleted_attrs: usize,
+}
+
+impl RetainedProtocolStateWrites {
+    pub(crate) fn required_tx_hashes(&self) -> HashSet<TxHash> {
+        self.latest
+            .iter()
+            .chain(self.to_archive.iter())
+            .filter_map(|row| row.batch_tx_hash().cloned())
+            .collect()
+    }
+
+    pub(crate) fn retained_rows(&self) -> usize {
+        self.latest.len() + self.to_archive.len()
+    }
+}
 
 // Private methods
 impl PostgresGateway {
@@ -147,6 +485,13 @@ impl PostgresGateway {
         use super::schema::{protocol_component::dsl::*, transaction::dsl::*};
         let chain_id_value = self.get_chain_id(chain)?;
 
+        if system.is_none() && ids.is_none() && min_tvl.is_none() && pagination_params.is_none() {
+            let res = self
+                .get_all_protocol_components_for_chain(*chain, chain_id_value, conn)
+                .await?;
+            return Ok(WithTotal { total: Some(res.len() as i64), entity: res });
+        }
+
         let mut count_query = protocol_component
             .left_join(schema::component_tvl::table)
             .into_boxed();
@@ -238,6 +583,108 @@ impl PostgresGateway {
             .await?;
 
         Ok(WithTotal { entity: res, total: Some(count) })
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all, fields(chain = %chain))]
+    async fn get_all_protocol_components_for_chain(
+        &self,
+        chain: Chain,
+        chain_id: i64,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<Vec<ProtocolComponent>, StorageError> {
+        let rows: Vec<FullProtocolComponentRow> = diesel::sql_query(
+            r#"
+            WITH token_addresses AS (
+                SELECT
+                    pcht.protocol_component_id,
+                    array_agg(a.address ORDER BY pcht.token_index) AS token_addresses
+                FROM protocol_component pc
+                INNER JOIN protocol_component_holds_token pcht
+                    ON pcht.protocol_component_id = pc.id
+                INNER JOIN token t
+                    ON t.id = pcht.token_id
+                INNER JOIN account a
+                    ON a.id = t.account_id
+                WHERE pc.chain_id = $1
+                GROUP BY pcht.protocol_component_id
+            ),
+            contract_addresses AS (
+                SELECT
+                    pchc.protocol_component_id,
+                    array_agg(a.address ORDER BY a.address) AS contract_addresses
+                FROM protocol_component pc
+                INNER JOIN protocol_component_holds_contract pchc
+                    ON pchc.protocol_component_id = pc.id
+                INNER JOIN contract_code cc
+                    ON cc.id = pchc.contract_code_id
+                INNER JOIN account a
+                    ON a.id = cc.account_id
+                WHERE pc.chain_id = $1
+                GROUP BY pchc.protocol_component_id
+            )
+            SELECT
+                pc.external_id::text AS external_id,
+                pc.attributes,
+                pc.created_at,
+                tx.hash AS creation_tx,
+                ps.name::text AS protocol_system,
+                pt.name::text AS protocol_type_name,
+                COALESCE(ta.token_addresses, ARRAY[]::bytea[]) AS token_addresses,
+                COALESCE(ca.contract_addresses, ARRAY[]::bytea[]) AS contract_addresses
+            FROM protocol_component pc
+            INNER JOIN "transaction" tx
+                ON tx.id = pc.creation_tx
+            INNER JOIN protocol_system ps
+                ON ps.id = pc.protocol_system_id
+            INNER JOIN protocol_type pt
+                ON pt.id = pc.protocol_type_id
+            LEFT JOIN token_addresses ta
+                ON ta.protocol_component_id = pc.id
+            LEFT JOIN contract_addresses ca
+                ON ca.protocol_component_id = pc.id
+            WHERE pc.chain_id = $1
+            ORDER BY pc.id
+            "#,
+        )
+        .bind::<BigInt, _>(chain_id)
+        .load(conn)
+        .await
+        .map_err(PostgresError::from)?;
+
+        rows.into_iter()
+            .map(|row| {
+                if row.token_addresses.is_empty() {
+                    return Err(StorageError::NotFound(
+                        "ProtocolComponent tokens".to_string(),
+                        row.external_id,
+                    ));
+                }
+
+                let static_attributes: HashMap<String, StoreVal> =
+                    if let Some(attributes) = row.attributes {
+                        serde_json::from_value(attributes).map_err(|_| {
+                            StorageError::DecodeError(
+                                "Failed to decode static attributes.".to_string(),
+                            )
+                        })?
+                    } else {
+                        Default::default()
+                    };
+
+                Ok(ProtocolComponent::new(
+                    &row.external_id,
+                    &row.protocol_system,
+                    &row.protocol_type_name,
+                    chain,
+                    row.token_addresses,
+                    row.contract_addresses,
+                    static_attributes,
+                    ChangeType::Creation,
+                    row.creation_tx,
+                    row.created_at,
+                ))
+            })
+            .collect()
     }
 
     #[instrument(level = Level::DEBUG, skip(self, orm_protocol_components, conn))]
@@ -788,6 +1235,346 @@ impl PostgresGateway {
                 Ok(WithTotal { entity: protocol_states, total: state_data.total })
             }
         }
+    }
+
+    async fn transaction_ids_by_hashes(
+        hashes: &HashSet<TxHash>,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<HashMap<TxHash, i64>, StorageError> {
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        Ok(orm::Transaction::ids_and_ts_by_hash(hashes.iter(), conn)
+            .await
+            .map_err(PostgresError::from)?
+            .into_iter()
+            .map(|(id, hash, _, _)| (hash, id))
+            .collect())
+    }
+
+    pub(crate) async fn plan_retained_component_balances(
+        &self,
+        component_balances: &[ComponentBalance],
+        chain: &Chain,
+        tx_metadata: &HashMap<TxHash, ProtocolTxMetadata>,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<RetainedComponentBalanceWrites, StorageError> {
+        use super::schema::{account::dsl::*, token::dsl::*};
+
+        let chain_db_id = self.get_chain_id(chain)?;
+        let token_addresses: HashSet<Address> = component_balances
+            .iter()
+            .map(|component_balance| component_balance.token.clone())
+            .collect();
+        let token_ids: HashMap<Address, i64> = token
+            .inner_join(account)
+            .select((schema::account::address, schema::token::id))
+            .filter(schema::account::address.eq_any(&token_addresses))
+            .load::<(Address, i64)>(conn)
+            .await
+            .map_err(PostgresError::from)?
+            .into_iter()
+            .collect();
+
+        let protocol_component_ids: HashMap<String, i64> =
+            orm::ProtocolComponent::ids_by_external_ids(
+                component_balances
+                    .iter()
+                    .map(|component_balance| component_balance.component_id.as_str()),
+                chain_db_id,
+                conn,
+            )
+            .await
+            .map_err(PostgresError::from)?
+            .into_iter()
+            .map(|(component_id, external_id)| (external_id, component_id))
+            .collect();
+
+        let mut planned_balances = Vec::new();
+        for component_balance in component_balances {
+            let token_id = token_ids
+                .get(&component_balance.token)
+                .ok_or_else(|| {
+                    error!(?chain, ?component_balance.token, ?component_balance, "Token not found");
+                    StorageError::NotFound("Token".to_string(), component_balance.token.to_string())
+                })?;
+            let protocol_component_id = protocol_component_ids
+                .get(&component_balance.component_id)
+                .ok_or_else(|| {
+                    error!(?chain, ?component_balance.component_id, ?component_balance, "Protocol component not found");
+                    StorageError::NotFound("ProtocolComponent".to_string(), component_balance.component_id.to_string())
+                })?;
+            let tx_metadata = tx_metadata
+                .get(&component_balance.modify_tx)
+                .ok_or_else(|| {
+                    StorageError::NotFound(
+                        "Transaction metadata".to_string(),
+                        component_balance.modify_tx.to_string(),
+                    )
+                })?;
+
+            planned_balances.push(WithOrdinal::new(
+                VersioningEntry::Update(PlannedComponentBalance::new(
+                    *token_id,
+                    component_balance.balance.clone(),
+                    component_balance.balance_float,
+                    component_balance.modify_tx.clone(),
+                    *protocol_component_id,
+                    tx_metadata.ts,
+                )),
+                (*protocol_component_id, *token_id, tx_metadata.ts, tx_metadata.index),
+            ));
+        }
+
+        if planned_balances.is_empty() {
+            return Ok(RetainedComponentBalanceWrites::default());
+        }
+
+        planned_balances.sort_by_cached_key(|b| b.ordinal);
+        let sorted = planned_balances
+            .into_iter()
+            .map(|b| b.entity)
+            .collect::<Vec<_>>();
+        let (latest, to_archive, _) =
+            apply_partitioned_versioning(&sorted, self.retention_horizon, conn).await?;
+
+        Ok(RetainedComponentBalanceWrites {
+            latest,
+            to_archive,
+            raw_rows: component_balances.len(),
+        })
+    }
+
+    pub(crate) async fn insert_retained_component_balances(
+        &self,
+        plan: &RetainedComponentBalanceWrites,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<(), StorageError> {
+        let required_tx_hashes = plan.required_tx_hashes();
+        let tx_ids = Self::transaction_ids_by_hashes(&required_tx_hashes, conn).await?;
+
+        let to_archive = plan
+            .to_archive
+            .iter()
+            .map(|row| row.resolve(&tx_ids))
+            .collect::<Result<Vec<_>, _>>()?;
+        let latest = plan
+            .latest
+            .iter()
+            .map(|row| row.resolve(&tx_ids))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !to_archive.is_empty() {
+            for chunk in to_archive.chunks(orm::NewComponentBalance::MAX_BATCH_SIZE) {
+                diesel::insert_into(schema::component_balance::table)
+                    .values(chunk)
+                    .execute(conn)
+                    .await
+                    .map_err(|err| {
+                        storage_error_from_diesel(err, "ComponentBalance", "batch", None)
+                    })?;
+            }
+        }
+
+        let latest = latest
+            .into_iter()
+            .map(orm::NewComponentBalanceLatest::from)
+            .collect::<Vec<_>>();
+        if !latest.is_empty() {
+            for chunk in latest.chunks(orm::NewComponentBalanceLatest::MAX_BATCH_SIZE) {
+                diesel::insert_into(schema::component_balance_default::table)
+                    .values(chunk)
+                    .on_conflict(on_constraint("component_balance_default_unique_pk"))
+                    .do_update()
+                    .set((
+                        schema::component_balance_default::new_balance
+                            .eq(excluded(schema::component_balance_default::new_balance)),
+                        schema::component_balance_default::balance_float
+                            .eq(excluded(schema::component_balance_default::balance_float)),
+                        schema::component_balance_default::previous_value
+                            .eq(excluded(schema::component_balance_default::previous_value)),
+                        schema::component_balance_default::modify_tx
+                            .eq(excluded(schema::component_balance_default::modify_tx)),
+                        schema::component_balance_default::valid_from
+                            .eq(excluded(schema::component_balance_default::valid_from)),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(|err| {
+                        storage_error_from_diesel(err, "ComponentBalance", "batch", None)
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn plan_retained_protocol_states(
+        &self,
+        chain: &Chain,
+        new: &[(TxHash, &ProtocolComponentStateDelta)],
+        tx_metadata: &HashMap<TxHash, ProtocolTxMetadata>,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<RetainedProtocolStateWrites, StorageError> {
+        let chain_db_id = self.get_chain_id(chain)?;
+        let components: HashMap<String, i64> = orm::ProtocolComponent::ids_by_external_ids(
+            new.iter()
+                .map(|(_, state)| state.component_id.as_str()),
+            chain_db_id,
+            conn,
+        )
+        .await
+        .map_err(PostgresError::from)?
+        .into_iter()
+        .map(|(id, external_id)| (external_id, id))
+        .collect();
+
+        let mut raw_updated_attrs = 0usize;
+        let mut raw_deleted_attrs = 0usize;
+        let mut state_data = Vec::new();
+        for (tx, state) in new {
+            let tx_metadata = tx_metadata.get(tx).ok_or_else(|| {
+                StorageError::NotFound("Transaction metadata".to_string(), tx.to_string())
+            })?;
+            let component_db_id = *components
+                .get(&state.component_id)
+                .ok_or(StorageError::NotFound(
+                    "Component id".to_string(),
+                    state.component_id.to_string(),
+                ))?;
+
+            raw_updated_attrs += state.updated_attributes.len();
+            state_data.extend(
+                state
+                    .updated_attributes
+                    .iter()
+                    .map(|(attribute, value)| {
+                        WithOrdinal::new(
+                            VersioningEntry::Update(PlannedProtocolState::new(
+                                component_db_id,
+                                attribute,
+                                value,
+                                tx.clone(),
+                                tx_metadata.ts,
+                            )),
+                            (component_db_id, attribute, tx_metadata.ts, tx_metadata.index),
+                        )
+                    }),
+            );
+
+            raw_deleted_attrs += state.deleted_attributes.len();
+            state_data.extend(
+                state
+                    .deleted_attributes
+                    .iter()
+                    .map(|attr| {
+                        WithOrdinal::new(
+                            VersioningEntry::Deletion((
+                                (component_db_id, attr.clone()),
+                                tx_metadata.ts,
+                            )),
+                            (component_db_id, attr, tx_metadata.ts, tx_metadata.index),
+                        )
+                    }),
+            );
+        }
+
+        if state_data.is_empty() {
+            return Ok(RetainedProtocolStateWrites::default());
+        }
+
+        state_data.sort_by_cached_key(|b| b.ordinal);
+        let sorted = state_data
+            .into_iter()
+            .map(|b| b.entity)
+            .collect::<Vec<_>>();
+        let (latest, to_archive, to_delete) =
+            apply_partitioned_versioning(&sorted, self.retention_horizon, conn).await?;
+
+        Ok(RetainedProtocolStateWrites {
+            latest,
+            to_archive,
+            to_delete,
+            raw_updated_attrs,
+            raw_deleted_attrs,
+        })
+    }
+
+    pub(crate) async fn insert_retained_protocol_states(
+        &self,
+        plan: &RetainedProtocolStateWrites,
+        conn: &mut AsyncPgConnection,
+    ) -> Result<(), StorageError> {
+        let required_tx_hashes = plan.required_tx_hashes();
+        let tx_ids = Self::transaction_ids_by_hashes(&required_tx_hashes, conn).await?;
+
+        let to_archive = plan
+            .to_archive
+            .iter()
+            .map(|row| row.resolve(&tx_ids))
+            .collect::<Result<Vec<_>, _>>()?;
+        let latest = plan
+            .latest
+            .iter()
+            .map(|row| row.resolve(&tx_ids))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !to_archive.is_empty() {
+            trace!(records=?&to_archive, "Inserting archival records!");
+            for chunk in to_archive.chunks(orm::NewProtocolState::MAX_BATCH_SIZE) {
+                diesel::insert_into(schema::protocol_state::table)
+                    .values(chunk)
+                    .execute(conn)
+                    .await
+                    .map_err(PostgresError::from)?;
+            }
+        }
+
+        let latest: Vec<orm::NewProtocolStateLatest> = latest
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        if !latest.is_empty() {
+            trace!(new_state=?&latest, "Updating active state!");
+            for chunk in latest.chunks(orm::NewProtocolStateLatest::MAX_BATCH_SIZE) {
+                diesel::insert_into(schema::protocol_state_default::table)
+                    .values(chunk)
+                    .on_conflict(on_constraint("protocol_state_default_unique_pk"))
+                    .do_update()
+                    .set((
+                        schema::protocol_state_default::attribute_value
+                            .eq(excluded(schema::protocol_state_default::attribute_value)),
+                        schema::protocol_state_default::previous_value
+                            .eq(excluded(schema::protocol_state_default::previous_value)),
+                        schema::protocol_state_default::modify_tx
+                            .eq(excluded(schema::protocol_state_default::modify_tx)),
+                        schema::protocol_state_default::valid_from
+                            .eq(excluded(schema::protocol_state_default::valid_from)),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(PostgresError::from)?;
+            }
+        }
+
+        if !plan.to_delete.is_empty() {
+            let mut delete_query =
+                diesel::delete(schema::protocol_state_default::table).into_boxed();
+            for (component_id, attr_name) in &plan.to_delete {
+                delete_query = delete_query.or_filter(
+                    schema::protocol_state_default::protocol_component_id
+                        .eq(*component_id)
+                        .and(schema::protocol_state_default::attribute_name.eq(attr_name)),
+                );
+            }
+            delete_query
+                .execute(conn)
+                .await
+                .map_err(PostgresError::from)?;
+        }
+
+        Ok(())
     }
 
     pub async fn update_protocol_states(

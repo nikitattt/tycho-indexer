@@ -58,6 +58,7 @@ pub enum Chain {
     Bsc,
     Unichain,
     Polygon,
+    Robinhood,
 }
 
 impl From<models::contract::Account> for ResponseAccount {
@@ -93,6 +94,7 @@ impl From<models::Chain> for Chain {
             models::Chain::Bsc => Chain::Bsc,
             models::Chain::Unichain => Chain::Unichain,
             models::Chain::Polygon => Chain::Polygon,
+            models::Chain::Robinhood => Chain::Robinhood,
         }
     }
 }

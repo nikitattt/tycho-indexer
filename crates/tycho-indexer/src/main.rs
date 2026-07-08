@@ -47,7 +47,10 @@ use tycho_ethereum::{
     },
 };
 use tycho_indexer::{
-    cli::{AnalyzeTokenArgs, Cli, Command, GlobalArgs, IndexArgs, RunSpkgArgs, SubstreamsArgs},
+    cli::{
+        AnalyzeTokenArgs, Cli, Command, GlobalArgs, IndexArgs, RpcOnlyArgs, RunSpkgArgs,
+        SubstreamsArgs,
+    },
     extractor::{
         chain_state::ChainState,
         protocol_cache::ProtocolMemoryCache,
@@ -99,8 +102,8 @@ fn main() -> Result<(), anyhow::Error> {
         Command::AnalyzeTokens(analyze_args) => {
             run_analyze_tokens(global_args, analyze_args).map_err(|e| anyhow!(e))?;
         }
-        Command::Rpc => {
-            run_rpc(global_args).map_err(|e| anyhow!(e))?;
+        Command::Rpc(rpc_args) => {
+            run_rpc(global_args, rpc_args).map_err(|e| anyhow!(e))?;
         }
     };
     Ok(())
@@ -323,13 +326,13 @@ async fn run_spkg(global_args: GlobalArgs, run_args: RunSpkgArgs) -> Result<(), 
 }
 
 #[tokio::main]
-async fn run_rpc(global_args: GlobalArgs) -> Result<(), ExtractionError> {
+async fn run_rpc(global_args: GlobalArgs, rpc_args: RpcOnlyArgs) -> Result<(), ExtractionError> {
     create_tracing_subscriber();
 
     let rpc_client = global_args.rpc.build_client()?;
 
     let direct_gw = GatewayBuilder::new(&global_args.database_url)
-        .set_chains(&[Chain::Ethereum]) // TODO: handle multichain
+        .set_chains(&rpc_args.chains)
         .build_direct_gw()
         .await?;
 
