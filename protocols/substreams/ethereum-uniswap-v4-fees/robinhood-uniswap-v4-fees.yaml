@@ -1,6 +1,6 @@
 specVersion: v0.1.0
 package:
-  name: "ethereum_uniswap_v4_fees"
+  name: "robinhood_uniswap_v4_fees"
   version: v0.1.0
 
 protobuf:

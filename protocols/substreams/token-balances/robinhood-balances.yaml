@@ -1,0 +1,32 @@
+specVersion: v0.1.0
+package:
+    name: "robinhood_token_balances"
+    version: v0.1.0
+
+protobuf:
+    files:
+        - tycho/evm/v1/common.proto
+        - tycho/evm/v1/entity.proto
+    importPaths:
+        - ../../../proto/
+    excludePaths:
+        - sf/ethereum
+        - google
+
+binaries:
+    default:
+        type: wasm/rust-v1
+        file: ../target/wasm32-unknown-unknown/release/token_balances.wasm
+
+modules:
+    - name: map_balance_changes
+      kind: map
+      initialBlock: 42415918
+      inputs:
+          - params: string
+          - source: sf.ethereum.type.v2.Block
+      output:
+          type: proto:tycho.evm.v1.BlockChanges
+
+params:
+    map_balance_changes: "address=0000000000000000000000000000000000000000"
