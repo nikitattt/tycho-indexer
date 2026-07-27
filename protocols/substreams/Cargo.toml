@@ -28,6 +28,7 @@ members = [
     "ethereum-fluid",
     "base-aerodrome-slipstreams",
     "ethereum-uniswap-v3-logs-with-fees",
+    "robinhood-uniswap-v3-logs-with-fees",
     "ethereum-uniswap-v4-fees",
     "ethereum-erc4626",
     "ethereum-rocketpool",

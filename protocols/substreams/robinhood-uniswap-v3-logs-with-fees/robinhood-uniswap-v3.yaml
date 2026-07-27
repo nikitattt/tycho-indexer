@@ -1,0 +1,31 @@
+specVersion: v0.1.0
+package:
+    name: "robinhood_uniswap_v3_logs_with_fees"
+    version: v0.1.0
+
+imports:
+    v3: ./spkg/robinhood-uniswap-v3-fees-v0.1.0.spkg
+
+binaries:
+    default:
+        type: wasm/rust-v1
+        file: ../target/wasm32-unknown-unknown/release/robinhood_uniswap_v3_logs_with_fees.wasm
+
+modules:
+    - name: map_protocol_fee_changes
+      kind: map
+      initialBlock: 20702036
+      inputs:
+          - source: sf.ethereum.type.v2.Block
+          - store: v3:store_pools
+      output:
+          type: proto:tycho.evm.v1.BlockChanges
+
+    - name: map_protocol_changes_with_fees
+      kind: map
+      initialBlock: 8930
+      inputs:
+          - map: v3:map_protocol_changes
+          - map: map_protocol_fee_changes
+      output:
+          type: proto:tycho.evm.v1.BlockChanges

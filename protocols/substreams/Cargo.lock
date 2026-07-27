@@ -2320,6 +2320,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "robinhood-uniswap-v3-logs-with-fees"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "hex",
+ "hex-literal 0.4.1",
+ "itertools 0.13.0",
+ "prost 0.11.9",
+ "prost-types 0.11.9",
+ "substreams 0.5.22",
+ "substreams-ethereum 0.9.13",
+ "tycho-substreams 0.8.0",
+]
+
+[[package]]
 name = "rstest"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
