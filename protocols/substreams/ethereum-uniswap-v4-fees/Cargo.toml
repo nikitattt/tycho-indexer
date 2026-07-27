@@ -1,0 +1,19 @@
+[package]
+name = "ethereum-uniswap-v4-fees"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ethereum_uniswap_v4_fees"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.75"
+hex = "0.4.3"
+substreams = "0.5.22"
+substreams-ethereum = "0.9.9"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+tycho-substreams = { path = "../crates/tycho-substreams" }
+
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = { version = "0.2", features = ["custom"] }
