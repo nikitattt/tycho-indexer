@@ -48,8 +48,9 @@ substreams pack robinhood-uniswap-v3.yaml
 Configure Tycho with `map_protocol_changes_with_fees`. For a fee-only repair,
 use `map_protocol_fee_changes`.
 
-The fee module starts at Robinhood block `8930`; a resumed extractor still
-starts from its saved cursor. It emits accrued-fee changes through block
+The current manifest starts the fee module at bootstrap continuation block
+`20,702,036`. If the finalized bootstrap block changes, set this initial block
+to `B + 1` before packing. The overlay emits accrued-fee changes through block
 `43,005,491`. At block `43,005,492`, the imported parent package starts emitting
 those attributes and the overlay stops its duplicate extraction work.
 
