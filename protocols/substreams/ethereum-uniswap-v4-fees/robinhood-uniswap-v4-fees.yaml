@@ -1,7 +1,7 @@
 specVersion: v0.1.0
 package:
   name: "robinhood_uniswap_v4_fees"
-  version: v0.1.0
+  version: v0.1.1
 
 protobuf:
   files:
@@ -21,7 +21,7 @@ binaries:
 modules:
   - name: map_protocol_fee_changes
     kind: map
-    initialBlock: 21688329
+    initialBlock: 20558674
     inputs:
       - params: string
       - source: sf.ethereum.type.v2.Block
@@ -29,4 +29,4 @@ modules:
       type: proto:tycho.evm.v1.BlockChanges
 
 params:
-  map_protocol_fee_changes: "8366a39CC670B4001A1121B8F6A443A643e40951"
+  map_protocol_fee_changes: "pool_manager=8366a39CC670B4001A1121B8F6A443A643e40951&component_creation_block=20558674"

@@ -16,19 +16,40 @@ const SWAP_ZERO_FOR_ONE_LAST_BYTE: usize = 195;
 const CURRENCY0_START: usize = 16;
 const CURRENCY1_START: usize = 48;
 const ADDRESS_LENGTH: usize = 20;
+const BOOTSTRAP_TX_DOMAIN: &[u8] = b"tycho/uniswap-v4-fees/component/v1";
 
 #[substreams::handlers::map]
 pub fn map_protocol_fee_changes(params: String, block: eth::Block) -> Result<BlockChanges> {
+    map_protocol_fee_changes_impl(&params, block)
+}
+
+fn map_protocol_fee_changes_impl(params: &str, block: eth::Block) -> Result<BlockChanges> {
     if block.detail_level != i32::from(eth::block::DetailLevel::DetaillevelExtended) {
         return Err(anyhow!("map_protocol_fee_changes requires the extended Ethereum block model"));
     }
 
-    let pool_manager = parse_address(&params)?;
-    let changes = block
-        .transaction_traces
-        .iter()
-        .filter_map(|tx| transaction_changes(tx, &pool_manager))
-        .collect();
+    let config = parse_params(params)?;
+    let mut changes = Vec::new();
+
+    if block.number == config.component_creation_block {
+        let tx = bootstrap_transaction(&block, &config.pool_manager);
+        let mut bootstrap_changes = TransactionChanges::new(&tx);
+        let component_id = format!("0x{}", hex::encode(config.pool_manager));
+        bootstrap_changes
+            .component_changes
+            .push(
+                ProtocolComponent::new(&component_id)
+                    .as_swap_type("uniswap_v4_protocol_fees", ImplementationType::Custom),
+            );
+        changes.push(bootstrap_changes);
+    }
+
+    changes.extend(
+        block
+            .transaction_traces
+            .iter()
+            .filter_map(|tx| transaction_changes(tx, &config.pool_manager)),
+    );
 
     Ok(BlockChanges { block: Some((&block).into()), changes, ..Default::default() })
 }
@@ -42,15 +63,10 @@ fn transaction_changes(
     }
 
     let mut pending = Vec::new();
-    let mut creates_component = false;
 
     for call in &tx.calls {
         if call.state_reverted {
             continue;
-        }
-
-        if call.call_type() == eth::CallType::Create && call.address == pool_manager.as_slice() {
-            creates_component = true;
         }
 
         if call.address != pool_manager.as_slice() || call.storage_changes.is_empty() {
@@ -73,7 +89,7 @@ fn transaction_changes(
         }
     }
 
-    if !creates_component && pending.is_empty() {
+    if pending.is_empty() {
         return None;
     }
 
@@ -81,31 +97,22 @@ fn transaction_changes(
     let mut changes = TransactionChanges::new(&tycho_tx);
     let component_id = format!("0x{}", hex::encode(pool_manager));
 
-    if creates_component {
-        changes.component_changes.push(
-            ProtocolComponent::at_contract(pool_manager)
-                .as_swap_type("uniswap_v4_protocol_fees", ImplementationType::Custom),
-        );
-    }
-
-    if !pending.is_empty() {
-        pending.sort_unstable_by_key(|fee| fee.ordinal);
-        changes
-            .entity_changes
-            .push(EntityChanges {
-                component_id,
-                attributes: pending
-                    .into_iter()
-                    .map(|fee| Attribute {
-                        name: protocol_fee_attribute_name(&fee.currency),
-                        // Tycho attributes use signed big-endian integers. Converting from the
-                        // unsigned storage word preserves values above 2^255 - 1 as positive.
-                        value: BigInt::from_unsigned_bytes_be(&fee.new_value).to_signed_bytes_be(),
-                        change: ChangeType::Update.into(),
-                    })
-                    .collect(),
-            });
-    }
+    pending.sort_unstable_by_key(|fee| fee.ordinal);
+    changes
+        .entity_changes
+        .push(EntityChanges {
+            component_id,
+            attributes: pending
+                .into_iter()
+                .map(|fee| Attribute {
+                    name: protocol_fee_attribute_name(&fee.currency),
+                    // Tycho attributes use signed big-endian integers. Converting from the
+                    // unsigned storage word preserves values above 2^255 - 1 as positive.
+                    value: BigInt::from_unsigned_bytes_be(&fee.new_value).to_signed_bytes_be(),
+                    change: ChangeType::Update.into(),
+                })
+                .collect(),
+        });
 
     Some(changes)
 }
@@ -177,6 +184,63 @@ struct PendingFee {
     currency: [u8; ADDRESS_LENGTH],
     ordinal: u64,
     new_value: Vec<u8>,
+}
+
+struct Config {
+    pool_manager: [u8; ADDRESS_LENGTH],
+    component_creation_block: u64,
+}
+
+fn parse_params(raw: &str) -> Result<Config> {
+    let mut pool_manager = None;
+    let mut component_creation_block = None;
+
+    for param in raw.trim().split('&') {
+        let (key, value) = param
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid parameter `{param}`; expected key=value"))?;
+
+        match key {
+            "pool_manager" => pool_manager = Some(parse_address(value)?),
+            "component_creation_block" => {
+                component_creation_block = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|error| anyhow!("invalid component_creation_block: {error}"))?,
+                )
+            }
+            _ => return Err(anyhow!("unknown parameter `{key}`")),
+        }
+    }
+
+    Ok(Config {
+        pool_manager: pool_manager.ok_or_else(|| anyhow!("missing pool_manager parameter"))?,
+        component_creation_block: component_creation_block
+            .ok_or_else(|| anyhow!("missing component_creation_block parameter"))?,
+    })
+}
+
+fn bootstrap_transaction(block: &eth::Block, pool_manager: &[u8; ADDRESS_LENGTH]) -> Transaction {
+    let mut hash = [0u8; 32];
+    let mut hasher = Keccak::v256();
+    hasher.update(BOOTSTRAP_TX_DOMAIN);
+    hasher.update(&block.hash);
+    hasher.update(pool_manager);
+    hasher.finalize(&mut hash);
+
+    let index = block
+        .transaction_traces
+        .iter()
+        .map(|tx| u64::from(tx.index))
+        .max()
+        .map_or(0, |index| index + 1);
+
+    Transaction {
+        hash: hash.to_vec(),
+        from: vec![0; ADDRESS_LENGTH],
+        to: pool_manager.to_vec(),
+        index,
+    }
 }
 
 fn parse_address(raw: &str) -> Result<[u8; ADDRESS_LENGTH]> {
@@ -285,19 +349,28 @@ mod tests {
     }
 
     #[test]
-    fn creates_singleton_component_on_pool_manager_deployment() {
-        let call = eth::Call {
-            address: MANAGER.to_vec(),
-            call_type: eth::CallType::Create.into(),
+    fn creates_unlinked_singleton_component_at_configured_block() {
+        let block_number = 123;
+        let block = eth::Block {
+            number: block_number,
+            hash: vec![0xaa; 32],
+            header: Some(eth::BlockHeader {
+                timestamp: Some(Default::default()),
+                ..Default::default()
+            }),
+            detail_level: eth::block::DetailLevel::DetaillevelExtended.into(),
             ..Default::default()
         };
+        let params = format!(
+            "pool_manager=0x{}&component_creation_block={block_number}",
+            hex::encode(MANAGER)
+        );
 
-        let changes =
-            transaction_changes(&succeeded_tx(vec![call]), &MANAGER).expect("component creation");
-        let component = &changes.component_changes[0];
+        let changes = map_protocol_fee_changes_impl(&params, block).expect("component creation");
+        let component = &changes.changes[0].component_changes[0];
 
         assert_eq!(component.id, format!("0x{}", hex::encode(MANAGER)));
-        assert_eq!(component.contracts, vec![MANAGER.to_vec()]);
+        assert!(component.contracts.is_empty());
         assert!(component.tokens.is_empty());
         assert_eq!(
             component
@@ -307,6 +380,38 @@ mod tests {
                 .name,
             "uniswap_v4_protocol_fees"
         );
+    }
+
+    #[test]
+    fn does_not_create_component_outside_configured_block() {
+        let block = eth::Block {
+            number: 124,
+            hash: vec![0xaa; 32],
+            header: Some(eth::BlockHeader {
+                timestamp: Some(Default::default()),
+                ..Default::default()
+            }),
+            detail_level: eth::block::DetailLevel::DetaillevelExtended.into(),
+            ..Default::default()
+        };
+        let params =
+            format!("pool_manager=0x{}&component_creation_block=123", hex::encode(MANAGER));
+
+        let changes = map_protocol_fee_changes_impl(&params, block).expect("block changes");
+
+        assert!(changes.changes.is_empty());
+    }
+
+    #[test]
+    fn parses_named_params_in_any_order() {
+        let config = parse_params(&format!(
+            "component_creation_block=123&pool_manager=0x{}",
+            hex::encode(MANAGER)
+        ))
+        .expect("params");
+
+        assert_eq!(config.pool_manager, MANAGER);
+        assert_eq!(config.component_creation_block, 123);
     }
 
     fn swap_input(zero_for_one: bool) -> Vec<u8> {

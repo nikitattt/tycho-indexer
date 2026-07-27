@@ -21,7 +21,7 @@ binaries:
 modules:
     - name: map_balance_changes
       kind: map
-      initialBlock: 42415918
+      initialBlock: 20551042
       inputs:
           - params: string
           - source: sf.ethereum.type.v2.Block
@@ -29,4 +29,4 @@ modules:
           type: proto:tycho.evm.v1.BlockChanges
 
 params:
-    map_balance_changes: "address=0000000000000000000000000000000000000000"
+    map_balance_changes: "address=2aC03e14Cfe755426DaAEe0a4994184Ce81482F8"

@@ -29,4 +29,4 @@ modules:
       type: proto:tycho.evm.v1.BlockChanges
 
 params:
-  map_protocol_fee_changes: "28e2Ea090877bF75740558f6BFB36A5ffeE9e9dF"
+  map_protocol_fee_changes: "pool_manager=28e2Ea090877bF75740558f6BFB36A5ffeE9e9dF&component_creation_block=21688329"
