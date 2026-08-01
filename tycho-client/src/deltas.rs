@@ -486,7 +486,7 @@ impl WsDeltasClient {
     /// connection is established if not already connected.
     async fn ensure_connection(&self) -> Result<(), DeltasError> {
         if self.dead.load(Ordering::SeqCst) {
-            return Err(DeltasError::NotConnected)
+            return Err(DeltasError::NotConnected);
         };
         if !self.is_connected().await {
             self.conn_notify.notified().await;
@@ -696,22 +696,12 @@ impl WsDeltasClient {
             .subscriptions
             .get(&subscription_id)
         {
-            return
+            return;
         }
 
-        let (tx, rx) = oneshot::channel();
+        let (tx, _rx) = oneshot::channel();
         if let Err(e) = WsDeltasClient::unsubscribe_inner(inner, subscription_id, tx).await {
             warn!(?e, ?subscription_id, "Failed to send unsubscribe command");
-        } else {
-            // Wait for unsubscribe completion with timeout
-            match tokio::time::timeout(Duration::from_secs(5), rx).await {
-                Ok(_) => {
-                    debug!(?subscription_id, "Unsubscribe completed successfully");
-                }
-                Err(_) => {
-                    warn!(?subscription_id, "Unsubscribe completion timed out");
-                }
-            }
         }
     }
 
@@ -1047,17 +1037,13 @@ mod tests {
     }
 
     fn subscribe_with_compression(compression: bool) -> String {
-        serde_json::json!({
-            "method": "subscribe",
-            "extractor_id": {
-                "chain": "ethereum",
-                "name": "vm:ambient"
-            },
-            "include_state": true,
-            "compression": compression,
-            "partial_blocks": false
+        serde_json::to_string(&Command::Subscribe {
+            extractor_id: ExtractorIdentity::new(Chain::Ethereum, "vm:ambient"),
+            include_state: true,
+            compression,
+            partial_blocks: false,
         })
-        .to_string()
+        .unwrap()
     }
 
     fn subscription_confirmation() -> String {
@@ -1697,46 +1683,25 @@ mod tests {
         .expect("subscription timed out")
         .expect("subscription failed");
 
-        // Allow time for messages to be processed and buffer to fill up
+        // Leave the receiver idle until both messages have reached the one-slot buffer.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Collect all messages until channel closes or we get a reasonable number
-        let mut received_msgs = Vec::new();
+        let first_msg = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timed out waiting for buffered message")
+            .expect("subscription closed before delivering its buffered message");
+        assert_eq!(first_msg.block.number, 123, "Expected first message with block 123");
 
-        // Use a single longer timeout to collect messages until channel closes
-        while received_msgs.len() < 3 {
-            match timeout(Duration::from_millis(200), rx.recv()).await {
-                Ok(Some(msg)) => {
-                    received_msgs.push(msg);
-                }
-                Ok(None) => {
-                    // Channel closed - this is what we expect after buffer overflow
-                    break;
-                }
-                Err(_) => {
-                    // Timeout - no more messages coming
-                    break;
-                }
-            }
-        }
-
-        // Verify the key behavior: buffer overflow should limit messages and close channel
-        assert!(
-            received_msgs.len() <= 1,
-            "Expected buffer overflow to limit messages to at most 1, got {}",
-            received_msgs.len()
-        );
-
-        if let Some(first_msg) = received_msgs.first() {
-            assert_eq!(first_msg.block.number, 123, "Expected first message with block 123");
-        }
+        let closed = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("forced unsubscribe blocked the websocket receive loop");
+        assert!(closed.is_none(), "subscription should close after buffer overflow");
 
         // Test passed! The key behavior we're testing (buffer full causes force unsubscribe) has
         // been verified We don't need to explicitly close the client as it will be cleaned
         // up when dropped
 
         // Just wait for the tasks to finish cleanly
-        drop(rx); // Explicitly drop the receiver
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Abort the tasks to clean up
