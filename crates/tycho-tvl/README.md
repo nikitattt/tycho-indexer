@@ -15,7 +15,8 @@ Before running `tycho-tvl`, the indexer database must be available:
   and latest block data for the selected chain.
 - Database migrations must already be applied. `tycho-tvl` opens the existing
   database directly and does not run migrations or initialize enum rows.
-- Supported simulation protocols are currently `uniswap_v2` and `uniswap_v3`.
+- Supported simulation protocols are currently `uniswap_v2`, `uniswap_v3`, and core
+  `uniswap_v4` pools. Hook-managed pools in `uniswap_v4_hooks` are not supported.
 
 There is no built-in default for `DATABASE_URL`. Pass it explicitly or set it
 through the environment.
@@ -55,14 +56,14 @@ Common flags:
 
 | Flag | Env | Default | Description |
 | --- | --- | --- | --- |
-| `--run-mode initial\|incremental\|prune-stale-components` | | `incremental` | Selects broad discovery, cron-friendly update, or stale TVL pruning mode. |
+| `--run-mode initial\|bootstrap-v4\|incremental\|prune-stale-components` | | `incremental` | Selects broad discovery, v4-only bootstrap from existing prices, cron-friendly update, or stale TVL pruning mode. |
 | `--chain <chain>` | | `base` | Chain to process. Must match Tycho's `Chain` enum names. |
 | `--database-url <url>` | `DATABASE_URL` | required | Postgres database used by the indexer. |
-| `--protocol-systems <csv>` | | `uniswap_v2,uniswap_v3` | Comma-separated protocol systems to price and refresh TVL for. |
+| `--protocol-systems <csv>` | | `uniswap_v2,uniswap_v3,uniswap_v4` | Comma-separated protocol systems to price and refresh TVL for. |
 | `--write-batch-size <n>` | | `5000` | Batch size for token price writes and component TVL/prune updates. |
 | `--dry-run` | | `false` | Computes scope/counts and writes nothing. |
 
-Pricing flags used by `initial` and `incremental`:
+Pricing flags used by `initial`, `bootstrap-v4`, and `incremental`:
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -76,6 +77,12 @@ Initial-only flags:
 | --- | --- | --- |
 | `--max-rounds-initial <n>` | `6` | Maximum solver relaxation rounds in initial mode. |
 | `--min-initial-update-bps <bps>` | `10` | Stops initial mode after applying a round when `updates / known_prices` at round start is below this value. Use `0` to disable this early stop. |
+
+V4-bootstrap-only flags:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--max-rounds-bootstrap-v4 <n>` | `4` | Maximum solver rounds over the v4-only graph. Existing database prices are immutable seeds. |
 
 Incremental-only flags:
 
@@ -113,7 +120,7 @@ Initial mode:
 
 - loads all tokens for the chain through the same storage path as `/v1/tokens`;
 - loads all components for the configured protocol systems;
-- starts from hard native-token anchors such as Base WETH;
+- starts from hard native and wrapped-native-token anchors, such as Base ETH and WETH;
 - repeatedly prices the full loaded pool graph until no better prices appear or
   `--max-rounds-initial` is reached;
 - ignores tiny replacement prices below `--min-price-improvement-bps`, while
@@ -122,6 +129,13 @@ Initial mode:
   `updates / known_prices < --min-initial-update-bps`;
 - writes hard anchors and prices discovered in the current run;
 - refreshes `component_tvl` for all scoped components in batches.
+
+The initial graph is loaded by chain and protocol system without a
+`component_tvl` threshold. This allows a fresh Uniswap v4 deployment to bootstrap
+even when no v4 component has TVL yet: known native-token prices propagate through
+v2 and v3 pools, then those derived prices can be used as inputs to v4 simulations
+in later solver rounds. The same graph can also propagate prices in the opposite
+direction, from a v4 pool into v2 or v3.
 
 Use a dry run first on large databases:
 
@@ -169,6 +183,34 @@ only when the new native-denominated price differs enough from the current
 price. This makes later rounds converge faster when they are only finding tiny
 route-level changes.
 
+### Bootstrap V4 from Existing Prices
+
+Use `bootstrap-v4` when v2/v3 token prices are already populated and only v4
+prices and TVL need to be initialized:
+
+```bash
+DATABASE_URL=postgresql://postgres:mypassword@localhost:5431/tycho_indexer_0 \
+RUST_LOG=info \
+target/release/tycho-tvl \
+  --run-mode bootstrap-v4 \
+  --chain base
+```
+
+This mode:
+
+- forces the protocol scope to `uniswap_v4`, ignoring `--protocol-systems`;
+- loads every existing `token_price` for the chain as a protected seed and never
+  rewrites those prices;
+- loads all core v4 components and their tokens without a TVL threshold;
+- simulates only v4 pools, allowing an existing v2/v3-derived token price to
+  price the other side of a v4 pool;
+- performs up to `--max-rounds-bootstrap-v4` rounds so newly discovered prices
+  can propagate through additional v4 pools;
+- writes only newly derived prices and refreshes TVL for all core v4 components.
+
+For a read-only sizing run, add `--dry-run`. The dry run computes prices but does
+not write prices or refresh TVL.
+
 ### Incremental
 
 Incremental mode is intended for the recurring systemd timer:
@@ -199,6 +241,11 @@ Incremental mode:
 - writes only prices refreshed or discovered by the current run inside the
   incremental graph;
 - refreshes TVL only for components whose balances changed in the recent window.
+
+Recently changed components are always inserted into the incremental graph before
+candidate pools are ranked by existing TVL. Consequently, a changed v4 pool with
+no `component_tvl` row can still be priced from token prices previously established
+through v2 or v3.
 
 If the timer runs every five minutes, the default settings inspect roughly the
 last ten minutes of balance changes:
@@ -470,13 +517,16 @@ sudo -u tycho \
 ## Operational Notes
 
 - Run `initial` before relying on `tvl_gt` filters on a fresh database.
+- Use `bootstrap-v4` instead of `initial` when v2/v3 prices already exist and only
+  core v4 needs to be initialized.
 - Run `incremental` every five minutes after the initial bootstrap.
 - Run `prune-stale-components` daily so pools without recent balance changes do
   not keep polluting `tvl_gt` query results.
 - Run database migrations with the normal indexer deployment path before starting
   `tycho-tvl`; the sidecar intentionally skips migrations on startup.
-- If `--dry-run` reports zero prices, verify that the selected chain has WETH
-  anchor token metadata, component balances, and supported protocol components.
+- If `--dry-run` reports zero prices, verify that the selected chain has native or
+  wrapped-native anchor token metadata, component balances, and supported protocol
+  components.
 - If `component_tvl` remains empty, verify `token_price` has rows and that token
   prices are positive.
 - If incremental runs are too slow, reduce `--max-rounds-incremental`,

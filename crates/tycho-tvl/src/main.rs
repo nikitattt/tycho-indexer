@@ -12,7 +12,7 @@ use chrono::Duration as ChronoDuration;
 use clap::{Parser, ValueEnum};
 use num_bigint::BigUint;
 use num_traits::{ToPrimitive, Zero};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 use tycho_client::feed::{synchronizer::ComponentWithState, BlockHeader};
 use tycho_common::{
@@ -23,7 +23,10 @@ use tycho_common::{
     Bytes,
 };
 use tycho_simulation::{
-    evm::protocol::{uniswap_v2::state::UniswapV2State, uniswap_v3::state::UniswapV3State},
+    evm::protocol::{
+        uniswap_v2::state::UniswapV2State, uniswap_v3::state::UniswapV3State,
+        uniswap_v4::state::UniswapV4State,
+    },
     protocol::models::{DecoderContext, TryFromWithBlock},
 };
 use tycho_storage::postgres::{builder::GatewayBuilder, direct::DirectGateway};
@@ -45,6 +48,8 @@ const MIN_EDGE_INLIER_WEIGHT: f64 = 0.60;
 #[derive(Debug, Clone, ValueEnum)]
 enum RunMode {
     Initial,
+    #[value(name = "bootstrap-v4")]
+    BootstrapV4,
     Incremental,
     PruneStaleComponents,
 }
@@ -58,7 +63,7 @@ struct Cli {
     chain: String,
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: String,
-    #[arg(long, value_delimiter = ',', default_value = "uniswap_v2,uniswap_v3")]
+    #[arg(long, value_delimiter = ',', default_value = "uniswap_v2,uniswap_v3,uniswap_v4")]
     protocol_systems: Vec<String>,
     #[arg(long, default_value_t = 300)]
     cron_period_secs: i64,
@@ -70,6 +75,8 @@ struct Cli {
     prune_min_tvl: f64,
     #[arg(long, default_value_t = 6)]
     max_rounds_initial: usize,
+    #[arg(long, default_value_t = 4)]
+    max_rounds_bootstrap_v4: usize,
     #[arg(long, default_value_t = 4)]
     max_rounds_incremental: usize,
     #[arg(long, default_value_t = 10.0)]
@@ -193,7 +200,17 @@ async fn main() -> Result<()> {
     run(cli).await
 }
 
-async fn run(cli: Cli) -> Result<()> {
+fn apply_run_mode_protocol_scope(cli: &mut Cli) {
+    if matches!(cli.run_mode, RunMode::BootstrapV4) {
+        cli.protocol_systems = vec!["uniswap_v4".to_string()];
+    }
+}
+
+async fn run(mut cli: Cli) -> Result<()> {
+    // This mode deliberately ignores the broad default protocol list. Its purpose is to reuse the
+    // existing token-price table as immutable route context while scanning only core v4 pools.
+    apply_run_mode_protocol_scope(&mut cli);
+
     let chain =
         Chain::from_str(&cli.chain).with_context(|| format!("Unsupported chain {}", cli.chain))?;
     info!(
@@ -205,6 +222,7 @@ async fn run(cli: Cli) -> Result<()> {
         active_window_days = cli.active_window_days,
         prune_min_tvl = cli.prune_min_tvl,
         max_rounds_initial = cli.max_rounds_initial,
+        max_rounds_bootstrap_v4 = cli.max_rounds_bootstrap_v4,
         max_rounds_incremental = cli.max_rounds_incremental,
         min_initial_update_bps = cli.min_initial_update_bps,
         min_price_improvement_bps = cli.min_price_improvement_bps,
@@ -275,6 +293,17 @@ async fn run(cli: Cli) -> Result<()> {
             .keys()
             .cloned()
             .collect::<HashSet<_>>(),
+        RunMode::BootstrapV4 => {
+            info!("TychoTvlLoadingBootstrapV4Tokens");
+            let tokens = tvl_db
+                .get_token_addresses_for_protocols(&chain, &cli.protocol_systems)
+                .await
+                .context("failed to load Uniswap v4 token addresses")?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            info!(tokens = tokens.len(), "TychoTvlBootstrapV4TokensLoaded");
+            tokens
+        }
         RunMode::Incremental => {
             info!("TychoTvlLoadingDbTimestamp");
             let now = tvl_db
@@ -317,7 +346,7 @@ async fn run(cli: Cli) -> Result<()> {
     stats.target_tokens = target_tokens.len();
     info!(target_tokens = target_tokens.len(), "TychoTvlTargetTokensSelected");
 
-    let protected_tokens = hard_anchors
+    let mut protected_tokens = hard_anchors
         .keys()
         .cloned()
         .collect::<HashSet<_>>();
@@ -326,16 +355,26 @@ async fn run(cli: Cli) -> Result<()> {
         .map(|(address, price)| (address.clone(), PriceState::seed(*price)))
         .collect::<HashMap<_, _>>();
 
-    if matches!(cli.run_mode, RunMode::Incremental) {
+    if matches!(cli.run_mode, RunMode::BootstrapV4 | RunMode::Incremental) {
         for (address, db_price) in existing_db_prices {
             if let Some(token) = all_tokens_by_address.get(&address) {
                 if let Some(native_price) = db_price_to_native_per_token(db_price, token.decimals) {
                     price_book
-                        .entry(address)
+                        .entry(address.clone())
                         .or_insert_with(|| PriceState::seed(native_price));
+                    if matches!(cli.run_mode, RunMode::BootstrapV4) {
+                        protected_tokens.insert(address);
+                    }
                 }
             }
         }
+    }
+    if matches!(cli.run_mode, RunMode::BootstrapV4) {
+        info!(
+            seed_prices = price_book.len(),
+            protected_prices = protected_tokens.len(),
+            "TychoTvlBootstrapV4SeedPricesReady"
+        );
     }
     let seed_tokens = price_book
         .keys()
@@ -344,6 +383,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     let max_rounds = match cli.run_mode {
         RunMode::Initial => cli.max_rounds_initial,
+        RunMode::BootstrapV4 => cli.max_rounds_bootstrap_v4,
         RunMode::Incremental => cli.max_rounds_incremental,
         RunMode::PruneStaleComponents => unreachable!("prune mode exits before pricing"),
     };
@@ -354,6 +394,10 @@ async fn run(cli: Cli) -> Result<()> {
     // chain/protocol-system scope and lets prices propagate outward from hard native-token anchors.
     // That is intentionally expensive, but it is the mode that should maximize coverage after a
     // fresh indexer boot or after importing stale seed prices.
+    //
+    // Bootstrap-v4 mode loads every core v4 component without consulting component TVL, but starts
+    // from every existing database token price instead of just native anchors. Existing prices are
+    // protected from solver updates, and no v2/v3 components are loaded or simulated.
     //
     // Incremental mode starts from components whose balances changed recently, then discovers the
     // tokens inside those changed pools. This is important: starting from recently changed tokens
@@ -370,13 +414,20 @@ async fn run(cli: Cli) -> Result<()> {
     // whose balances changed in the recent window. That avoids rewriting unrelated component_tvl
     // rows just because a token also appears in those unrelated components.
     let graph_scope = match cli.run_mode {
-        RunMode::Initial => {
-            info!("TychoTvlLoadingInitialComponentGraph");
+        RunMode::Initial | RunMode::BootstrapV4 => {
+            info!(
+                bootstrap_v4 = matches!(cli.run_mode, RunMode::BootstrapV4),
+                "TychoTvlLoadingFullComponentGraph"
+            );
             let component_ids = tvl_db
                 .get_components_for_protocols(&chain, &cli.protocol_systems)
                 .await
                 .context("failed to load scoped components")?;
-            info!(components = component_ids.len(), "TychoTvlInitialComponentGraphLoaded");
+            info!(
+                components = component_ids.len(),
+                bootstrap_v4 = matches!(cli.run_mode, RunMode::BootstrapV4),
+                "TychoTvlFullComponentGraphLoaded"
+            );
             ComponentGraphScope {
                 component_ids: component_ids.iter().cloned().collect(),
                 affected_component_ids: component_ids.into_iter().collect(),
@@ -451,6 +502,7 @@ async fn run(cli: Cli) -> Result<()> {
             &component_ids,
             &all_tokens_by_address,
             &price_book,
+            &protected_tokens,
             cli.snapshot_batch_size,
             cli.max_deviation_bps,
             &mut stats,
@@ -524,16 +576,18 @@ async fn run(cli: Cli) -> Result<()> {
 
     // Convert solver output into rows for token_price.
     //
-    // Existing DB prices in incremental mode are loaded as seed context only. They are useful for
-    // simulating from already-priced tokens, but simply reading an old DB price must not make it a
-    // fresh write. Initial mode writes hard anchors and every price discovered by this run.
-    // Incremental mode writes only derived prices inside the expanded incremental graph, which
-    // includes target tokens plus any temporary intermediates reached while solving those targets.
+    // Existing DB prices in bootstrap-v4 and incremental modes are loaded as seed context only.
+    // They are useful for simulating from already-priced tokens, but simply reading an old DB price
+    // must not make it a fresh write. Initial mode writes hard anchors and every price discovered by
+    // this run. Bootstrap-v4 writes only newly derived v4-connected prices. Incremental mode writes
+    // only derived prices inside the expanded incremental graph, which includes target tokens plus
+    // any temporary intermediates reached while solving those targets.
     let db_prices = price_book
         .iter()
         .filter(|(address, state)| {
             let write_mode = match cli.run_mode {
                 RunMode::Initial => PriceWriteMode::Initial,
+                RunMode::BootstrapV4 => PriceWriteMode::Bootstrap,
                 RunMode::Incremental => PriceWriteMode::Incremental,
                 RunMode::PruneStaleComponents => unreachable!("prune mode exits before pricing"),
             };
@@ -925,6 +979,7 @@ async fn price_components(
     component_ids: &[String],
     all_tokens: &HashMap<Bytes, Token>,
     known_prices: &HashMap<Bytes, PriceState>,
+    protected_tokens: &HashSet<Bytes>,
     snapshot_batch_size: usize,
     max_deviation_bps: f64,
     stats: &mut RunStats,
@@ -1081,9 +1136,22 @@ async fn price_components(
             let mut batch_candidates = 0usize;
             let mut decoded_components = 0usize;
             let mut skipped_components = 0usize;
+            let mut skipped_without_price_work = 0usize;
             let mut decode_skip_stats = DecodeSkipStats::default();
             let rejected_before = stats.rejected_edges;
             for component_state in snapshots {
+                let token_addresses = component_state.component.tokens.clone();
+                let has_priced_input = token_addresses
+                    .iter()
+                    .any(|token| known_prices.contains_key(token));
+                let has_unprotected_output = token_addresses
+                    .iter()
+                    .any(|token| !protected_tokens.contains(token));
+                if !has_priced_input || !has_unprotected_output {
+                    skipped_without_price_work += 1;
+                    continue;
+                }
+
                 let sim = match decode_state(
                     protocol_system,
                     component_state.clone(),
@@ -1109,7 +1177,6 @@ async fn price_components(
                     }
                 };
 
-                let token_addresses = component_state.component.tokens.clone();
                 for token_in_addr in &token_addresses {
                     let Some(token_in) = all_tokens.get(token_in_addr) else {
                         continue;
@@ -1119,7 +1186,9 @@ async fn price_components(
                     };
 
                     for token_out_addr in &token_addresses {
-                        if token_out_addr == token_in_addr {
+                        if token_out_addr == token_in_addr
+                            || protected_tokens.contains(token_out_addr)
+                        {
                             continue;
                         }
 
@@ -1155,6 +1224,7 @@ async fn price_components(
                 batch_index,
                 decoded_components,
                 skipped_components,
+                skipped_without_price_work,
                 candidates = batch_candidates,
                 rejected_edges = stats.rejected_edges.saturating_sub(rejected_before),
                 total_candidates = candidates.len(),
@@ -1234,25 +1304,29 @@ async fn filter_component_ids_for_simulation(
     component_ids: &[String],
     batch_index: usize,
 ) -> Result<Vec<String>> {
-    if protocol_system != "uniswap_v3" {
+    let Some((required_attributes, required_attribute_prefixes)) =
+        simulation_state_requirements(protocol_system)
+    else {
         return Ok(component_ids.to_vec());
-    }
+    };
 
     debug!(
         protocol_system,
         batch_index,
         batch_components = component_ids.len(),
-        "TychoTvlFilteringV3ComponentsWithTickState"
+        "TychoTvlFilteringComponentsWithRequiredState"
     );
     let filtered = tvl_db
         .filter_components_with_state_requirements(
             &chain,
             component_ids,
-            &["liquidity", "sqrt_price_x96", "tick"],
-            &["ticks/"],
+            required_attributes,
+            required_attribute_prefixes,
         )
         .await
-        .context("failed to filter uniswap_v3 components by required state attributes")?;
+        .with_context(|| {
+            format!("failed to filter {protocol_system} components by required state attributes")
+        })?;
     debug!(
         protocol_system,
         batch_index,
@@ -1261,10 +1335,27 @@ async fn filter_component_ids_for_simulation(
         skipped_components = component_ids
             .len()
             .saturating_sub(filtered.len()),
-        "TychoTvlV3ComponentsWithTickStateFiltered"
+        "TychoTvlComponentsWithRequiredStateFiltered"
     );
 
     Ok(filtered)
+}
+
+fn simulation_state_requirements(protocol_system: &str) -> Option<(&[&str], &[&str])> {
+    match protocol_system {
+        "uniswap_v3" => Some((&["liquidity", "sqrt_price_x96", "tick"], &["ticks/"])),
+        "uniswap_v4" => Some((
+            &[
+                "liquidity",
+                "sqrt_price_x96",
+                "tick",
+                "protocol_fees/zero2one",
+                "protocol_fees/one2zero",
+            ],
+            &["ticks/"],
+        )),
+        _ => None,
+    }
 }
 
 async fn decode_state(
@@ -1291,6 +1382,25 @@ async fn decode_state(
         }
         "uniswap_v3" => {
             let state = UniswapV3State::try_from_with_header(
+                snapshot,
+                header,
+                &account_balances,
+                all_tokens,
+                &decoder_context,
+            )
+            .await?;
+            Ok(Box::new(state) as Box<dyn ProtocolSim>)
+        }
+        "uniswap_v4" => {
+            let mut snapshot = snapshot;
+            // `uniswap_v4` contains pools without swap hooks. Removing the hook address prevents
+            // the generic v4 decoder from constructing an unused VM hook handler for every pool.
+            // Swap-hook pools live under the separate, unsupported `uniswap_v4_hooks` system.
+            snapshot
+                .component
+                .static_attributes
+                .remove("hooks");
+            let state = UniswapV4State::try_from_with_header(
                 snapshot,
                 header,
                 &account_balances,
@@ -1504,19 +1614,13 @@ fn weighted_median(values: &[(f64, f64)]) -> Option<f64> {
 }
 
 fn hard_anchors(chain: &Chain) -> HashMap<Bytes, f64> {
-    let mut anchors = HashMap::new();
-    let address = match chain {
-        Chain::Ethereum => Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-        Chain::Base | Chain::Unichain => Some("0x4200000000000000000000000000000000000006"),
-        Chain::Robinhood => Some("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"),
-        _ => None,
-    };
-    if let Some(address) = address {
-        anchors.insert(Bytes::from_str(address).expect("hardcoded WETH address is valid"), 1.0);
-    } else {
-        warn!(?chain, "NoDefaultAnchorForChain");
-    }
-    anchors
+    HashMap::from([
+        // Uniswap v4 supports the native currency directly, represented by the zero address in
+        // Tycho. V2 and v3 generally use the wrapped native token. Anchoring both lets one mixed
+        // graph bootstrap prices through any of the three protocol generations.
+        (chain.native_token().address, 1.0),
+        (chain.wrapped_native_token().address, 1.0),
+    ])
 }
 
 fn init_tracing() {
@@ -1533,6 +1637,82 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uniswap_v4_snapshot_and_tokens() -> (ComponentWithState, HashMap<Bytes, Token>) {
+        let upstream_token = Token::new(
+            &Bytes::from(vec![1; 20]),
+            "V2_V3_PRICED",
+            18,
+            0,
+            &[Some(100_000)],
+            Chain::Ethereum,
+            100,
+        );
+        let token = Token::new(
+            &Bytes::from(vec![2; 20]),
+            "TOKEN",
+            18,
+            0,
+            &[Some(100_000)],
+            Chain::Ethereum,
+            100,
+        );
+        let liquidity = 1_000_000_000_000_000_000_000_000_i128;
+        let component = ResponseProtocolComponent {
+            id: "v4-pool".to_string(),
+            protocol_system: "uniswap_v4".to_string(),
+            protocol_type_name: "uniswap_v4_pool".to_string(),
+            tokens: vec![upstream_token.address.clone(), token.address.clone()],
+            static_attributes: HashMap::from([
+                ("key_lp_fee".to_string(), Bytes::from(500_u32.to_be_bytes().to_vec())),
+                ("tick_spacing".to_string(), Bytes::from(60_i32.to_be_bytes().to_vec())),
+                ("hooks".to_string(), Bytes::from(vec![0; 20])),
+            ]),
+            ..Default::default()
+        };
+        let state = ResponseProtocolState {
+            component_id: component.id.clone(),
+            attributes: HashMap::from([
+                (
+                    "liquidity".to_string(),
+                    Bytes::from(
+                        (liquidity as u128)
+                            .to_be_bytes()
+                            .to_vec(),
+                    ),
+                ),
+                ("tick".to_string(), Bytes::from(0_i32.to_be_bytes().to_vec())),
+                (
+                    "sqrt_price_x96".to_string(),
+                    Bytes::from(
+                        79_228_162_514_264_337_593_543_950_336_u128
+                            .to_be_bytes()
+                            .to_vec(),
+                    ),
+                ),
+                ("protocol_fees/zero2one".to_string(), Bytes::from(0_u32.to_be_bytes().to_vec())),
+                ("protocol_fees/one2zero".to_string(), Bytes::from(0_u32.to_be_bytes().to_vec())),
+                (
+                    "ticks/-60/net_liquidity".to_string(),
+                    Bytes::from(liquidity.to_be_bytes().to_vec()),
+                ),
+                (
+                    "ticks/60/net_liquidity".to_string(),
+                    Bytes::from((-liquidity).to_be_bytes().to_vec()),
+                ),
+                ("balance_owner".to_string(), Bytes::from(vec![9; 20])),
+            ]),
+            balances: HashMap::new(),
+        };
+        let all_tokens = HashMap::from([
+            (upstream_token.address.clone(), upstream_token),
+            (token.address.clone(), token),
+        ]);
+        (
+            ComponentWithState { state, component, component_tvl: None, entrypoints: Vec::new() },
+            all_tokens,
+        )
+    }
 
     #[test]
     fn price_unit_conversion_round_trips() {
@@ -1567,6 +1747,82 @@ mod tests {
         let weth = Bytes::from_str("0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73").unwrap();
 
         assert_eq!(anchors.get(&weth), Some(&1.0));
+    }
+
+    #[test]
+    fn hard_anchors_include_native_and_wrapped_native_tokens() {
+        let anchors = hard_anchors(&Chain::Ethereum);
+
+        assert_eq!(anchors.get(&Chain::Ethereum.native_token().address), Some(&1.0));
+        assert_eq!(
+            anchors.get(
+                &Chain::Ethereum
+                    .wrapped_native_token()
+                    .address
+            ),
+            Some(&1.0)
+        );
+    }
+
+    #[test]
+    fn default_protocol_graph_includes_uniswap_v4() {
+        let cli =
+            Cli::try_parse_from(["tycho-tvl", "--database-url", "postgres://unused"]).unwrap();
+
+        assert_eq!(cli.protocol_systems, ["uniswap_v2", "uniswap_v3", "uniswap_v4"]);
+    }
+
+    #[test]
+    fn bootstrap_v4_mode_forces_v4_only_scope() {
+        let mut cli = Cli::try_parse_from([
+            "tycho-tvl",
+            "--database-url",
+            "postgres://unused",
+            "--run-mode",
+            "bootstrap-v4",
+            "--protocol-systems",
+            "uniswap_v2,uniswap_v3",
+        ])
+        .unwrap();
+
+        assert!(matches!(cli.run_mode, RunMode::BootstrapV4));
+        apply_run_mode_protocol_scope(&mut cli);
+        assert_eq!(cli.protocol_systems, ["uniswap_v4"]);
+    }
+
+    #[test]
+    fn uniswap_v4_state_requirements_include_fees_and_ticks() {
+        let (attributes, prefixes) = simulation_state_requirements("uniswap_v4").unwrap();
+
+        assert!(attributes.contains(&"liquidity"));
+        assert!(attributes.contains(&"protocol_fees/zero2one"));
+        assert!(attributes.contains(&"protocol_fees/one2zero"));
+        assert_eq!(prefixes, ["ticks/"]);
+    }
+
+    #[tokio::test]
+    async fn uniswap_v4_price_bootstraps_from_v2_v3_price_without_tvl() {
+        let (snapshot, all_tokens) = uniswap_v4_snapshot_and_tokens();
+        assert!(snapshot.component_tvl.is_none());
+        let upstream_token = all_tokens
+            .values()
+            .find(|candidate| candidate.symbol == "V2_V3_PRICED")
+            .unwrap();
+        let token = all_tokens
+            .values()
+            .find(|candidate| candidate.symbol == "TOKEN")
+            .unwrap();
+
+        let sim = decode_state("uniswap_v4", snapshot, 1, &all_tokens)
+            .await
+            .unwrap();
+        // This input price represents a price established by a v2 or v3 pool in an earlier solver
+        // round. Component TVL is not consulted when simulating the v4 edge.
+        let upstream_native_price = 0.5;
+        let (native_per_token, _) =
+            price_edge(sim.as_ref(), upstream_token, token, upstream_native_price, 300.0).unwrap();
+
+        assert!((0.49..=0.51).contains(&native_per_token));
     }
 
     #[test]

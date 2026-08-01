@@ -40,6 +40,12 @@ struct TokenPriceRow {
 }
 
 #[derive(Debug, QueryableByName)]
+struct TokenAddressRow {
+    #[diesel(sql_type = Binary)]
+    address: Vec<u8>,
+}
+
+#[derive(Debug, QueryableByName)]
 struct ComponentExternalId {
     #[diesel(sql_type = Text)]
     external_id: String,
@@ -112,6 +118,42 @@ WHERE c.name = $1
         Ok(rows
             .into_iter()
             .map(|row| (Bytes::from(row.address), row.price))
+            .collect())
+    }
+
+    pub async fn get_token_addresses_for_protocols(
+        &self,
+        chain: &Chain,
+        protocol_systems: &[String],
+    ) -> Result<Vec<Bytes>> {
+        if protocol_systems.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.connection().await?;
+        let rows = sql_query(
+            r#"
+SELECT DISTINCT a.address AS address
+FROM protocol_component pc
+JOIN chain c ON c.id = pc.chain_id
+JOIN protocol_system ps ON ps.id = pc.protocol_system_id
+JOIN protocol_component_holds_token pcht ON pcht.protocol_component_id = pc.id
+JOIN token t ON t.id = pcht.token_id
+JOIN account a ON a.id = t.account_id AND a.chain_id = c.id
+WHERE c.name = $1
+  AND ps.name = ANY($2)
+  AND pc.deleted_at IS NULL
+"#,
+        )
+        .bind::<Text, _>(chain.to_string())
+        .bind::<Array<Text>, _>(protocol_systems.to_vec())
+        .load::<TokenAddressRow>(&mut conn)
+        .await
+        .with_context(|| format!("failed to load protocol token addresses for {chain}"))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Bytes::from(row.address))
             .collect())
     }
 

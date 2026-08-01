@@ -36,6 +36,7 @@ pub struct PriceCandidate {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PriceWriteMode {
     Initial,
+    Bootstrap,
     Incremental,
 }
 
@@ -48,13 +49,16 @@ pub fn should_write_price(
 ) -> bool {
     // Keep write behavior stricter than solver behavior.
     //
-    // The solver may carry prices that were only used as route context. In incremental mode that
-    // includes old DB prices loaded as seeds and intermediate prices discovered while solving a
-    // target token. Only derived prices inside the current graph are eligible for persistence.
-    // Initial mode has no old DB seed context, so anchors and newly discovered prices are written.
+    // The solver may carry prices that were only used as route context. In bootstrap and incremental
+    // modes that includes old DB prices loaded as seeds and intermediate prices discovered while
+    // solving a target token. Only derived prices inside the current graph are eligible for
+    // persistence. Initial mode has no old DB seed context, so anchors and newly discovered prices
+    // are written.
     match mode {
         PriceWriteMode::Initial => protected_tokens.contains(token) || !state.is_seed,
-        PriceWriteMode::Incremental => !state.is_seed && graph_tokens.contains(token),
+        PriceWriteMode::Bootstrap | PriceWriteMode::Incremental => {
+            !state.is_seed && graph_tokens.contains(token)
+        }
     }
 }
 
@@ -438,6 +442,27 @@ mod tests {
         assert!(!should_write_price(
             PriceWriteMode::Incremental,
             &token(3),
+            &PriceState::derived(2.0, 5.0, 1),
+            &protected,
+            &graph_tokens,
+        ));
+    }
+
+    #[test]
+    fn write_filter_bootstrap_does_not_rewrite_existing_seed_prices() {
+        let protected = HashSet::from([token(1)]);
+        let graph_tokens = HashSet::from([token(1), token(2)]);
+
+        assert!(!should_write_price(
+            PriceWriteMode::Bootstrap,
+            &token(1),
+            &PriceState::seed(1.0),
+            &protected,
+            &graph_tokens,
+        ));
+        assert!(should_write_price(
+            PriceWriteMode::Bootstrap,
+            &token(2),
             &PriceState::derived(2.0, 5.0, 1),
             &protected,
             &graph_tokens,
