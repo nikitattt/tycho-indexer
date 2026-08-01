@@ -1,4 +1,8 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -67,6 +71,39 @@ pub type SyncResult<T> = Result<T, SynchronizerError>;
 impl<T> From<SendError<T>> for SynchronizerError {
     fn from(err: SendError<T>) -> Self {
         SynchronizerError::ChannelError(format!("Failed to send message: {err}"))
+    }
+}
+
+/// Waits for an initial snapshot while continuing to drain the live deltas channel.
+///
+/// Snapshot retrieval can take longer than the deltas channel can buffer. Keeping the receiver
+/// active here prevents a slow snapshot request from causing the websocket client to unsubscribe.
+async fn await_snapshot_while_buffering<F, T>(
+    snapshot_fut: F,
+    msg_rx: &mut Receiver<BlockChanges>,
+    end_rx: &mut oneshot::Receiver<()>,
+    buffered_deltas: &mut VecDeque<BlockChanges>,
+) -> SyncResult<Option<T>>
+where
+    F: Future<Output = SyncResult<T>>,
+{
+    tokio::pin!(snapshot_fut);
+
+    loop {
+        select! {
+            snapshot = &mut snapshot_fut => return snapshot.map(Some),
+            deltas = msg_rx.recv() => {
+                match deltas {
+                    Some(deltas) => buffered_deltas.push_back(deltas),
+                    None => {
+                        return Err(SynchronizerError::ConnectionError(
+                            "Deltas channel closed while retrieving initial snapshot".to_string(),
+                        ));
+                    }
+                }
+            },
+            _ = &mut *end_rx => return Ok(None),
+        }
     }
 }
 
@@ -511,6 +548,8 @@ where
                 removed_components: Default::default(),
             };
 
+            let mut buffered_deltas = VecDeque::new();
+
             // If possible skip retrieving snapshots
             let msg = if !self.is_next_expected(&header) {
                 info!("Retrieving snapshot");
@@ -525,13 +564,29 @@ where
                 } else {
                     BlockHeader { revert: false, ..header.clone() }
                 };
-                let snapshot = self
-                    .get_snapshots::<Vec<&String>>(snapshot_header, None)
-                    .await?
-                    .merge(deltas_msg);
+                let snapshot = match await_snapshot_while_buffering(
+                    self.get_snapshots::<Vec<&String>>(snapshot_header, None),
+                    &mut msg_rx,
+                    &mut end_rx,
+                    &mut buffered_deltas,
+                )
+                .await?
+                {
+                    Some(snapshot) => snapshot.merge(deltas_msg),
+                    None => {
+                        info!("Received close signal while retrieving initial snapshot");
+                        return Ok(());
+                    }
+                };
                 let n_components = self.component_tracker.components.len();
                 let n_snapshots = snapshot.snapshots.states.len();
-                info!(n_components, n_snapshots, "Initial snapshot retrieved, starting delta message feed");
+                let n_buffered_deltas = buffered_deltas.len();
+                info!(
+                    n_components,
+                    n_snapshots,
+                    n_buffered_deltas,
+                    "Initial snapshot retrieved, starting delta message feed"
+                );
                 snapshot
             } else {
                 deltas_msg
@@ -539,97 +594,15 @@ where
             block_tx.send(Ok(msg)).await?;
             self.last_synced_block = Some(header.clone());
             loop {
+                if let Some(deltas) = buffered_deltas.pop_front() {
+                    self.process_delta(block_tx, deltas).await?;
+                    continue;
+                }
+
                 select! {
                     deltas_opt = msg_rx.recv() => {
-                        if let Some(mut deltas) = deltas_opt {
-                            let header: BlockHeader = (&deltas).into();
-                            debug!(block_number=?header.number, "Received delta message");
-
-                            let flushed_snapshots =
-                                self.take_flushed_deferred_snapshots(&header).await?;
-
-                            let (snapshots, removed_components) = {
-                                // 1. Remove components based on latest changes
-                                // 2. Add components based on latest changes, query those for snapshots
-                                let (to_add, to_remove) = self.component_tracker.filter_updated_components(&deltas);
-
-                                // Only components we don't track yet need a snapshot.
-                                let requiring_snapshot: Vec<String> = to_add
-                                    .iter()
-                                    .filter(|id| {
-                                        !self.component_tracker
-                                            .components
-                                            .contains_key(id.as_str())
-                                    })
-                                    .map(|id| id.to_string())
-                                    .collect();
-                                debug!(components=?requiring_snapshot, "SnapshotRequest");
-                                let requiring_snapshot_refs: Vec<&String> = requiring_snapshot.iter().collect();
-                                self.component_tracker
-                                    .start_tracking(&requiring_snapshot_refs)
-                                    .await?;
-
-                                // When partial_blocks: defer brand-new to next block's first message; only preexisting get snapshot now.
-                                let request_now: Vec<String> = if self.partial_blocks {
-                                    let (preexisting, brand_new) = requiring_snapshot
-                                        .into_iter()
-                                        .partition(|id| {
-                                            !deltas.new_protocol_components.contains_key(id.as_str())
-                                        });
-                                    self.deferred_snapshot_components.extend(brand_new);
-                                    preexisting
-                                } else {
-                                    requiring_snapshot
-                                };
-
-                                let mut snapshots = if request_now.is_empty() {
-                                    Snapshot::default()
-                                } else {
-                                    let snapshot_header = if self.partial_blocks && header.number > 0
-                                    {
-                                        // get snapshot at the previous block (current block is only partial and not available for querying)
-                                        BlockHeader {
-                                            number: header.number - 1,
-                                            hash: header.parent_hash.clone(),
-                                            ..Default::default()
-                                        }
-                                    } else {
-                                        BlockHeader { revert: false, ..header.clone() }
-                                    };
-                                    self.get_snapshots(snapshot_header, Some(&request_now))
-                                        .await?
-                                        .snapshots
-                                };
-
-                                snapshots.extend(flushed_snapshots);
-
-                                let removed_components = if !to_remove.is_empty() {
-                                    self.component_tracker.stop_tracking(&to_remove)
-                                } else {
-                                    Default::default()
-                                };
-
-                                (snapshots, removed_components)
-                            };
-
-                            // 3. Update entrypoints on the tracker (affects which contracts are tracked)
-                            self.component_tracker.process_entrypoints(&deltas.dci_update);
-
-                            // 4. Filter deltas by currently tracked components / contracts
-                            self.filter_deltas(&mut deltas);
-                            let n_changes = deltas.n_changes();
-
-                            // 5. Send the message
-                            let next = StateSyncMessage {
-                                header: header.clone(),
-                                snapshots,
-                                deltas: Some(deltas),
-                                removed_components,
-                            };
-                            block_tx.send(Ok(next)).await?;
-                            self.last_synced_block = Some(header.clone());
-
-                            debug!(block_number=?header.number, n_changes, "Finished processing delta message");
+                        if let Some(deltas) = deltas_opt {
+                            self.process_delta(block_tx, deltas).await?;
                         } else {
                             return Err(SynchronizerError::ConnectionError("Deltas channel closed".to_string()));
                         }
@@ -664,6 +637,112 @@ where
                 Err((e, Some(end_rx)))
             }
         }
+    }
+
+    async fn process_delta(
+        &mut self,
+        block_tx: &mut Sender<SyncResult<StateSyncMessage<BlockHeader>>>,
+        mut deltas: BlockChanges,
+    ) -> SyncResult<()> {
+        let header: BlockHeader = (&deltas).into();
+        debug!(block_number=?header.number, "Received delta message");
+
+        let flushed_snapshots = self
+            .take_flushed_deferred_snapshots(&header)
+            .await?;
+
+        let (snapshots, removed_components) = {
+            // 1. Remove components based on latest changes
+            // 2. Add components based on latest changes, query those for snapshots
+            let (to_add, to_remove) = self
+                .component_tracker
+                .filter_updated_components(&deltas);
+
+            // Only components we don't track yet need a snapshot.
+            let requiring_snapshot: Vec<String> = to_add
+                .iter()
+                .filter(|id| {
+                    !self
+                        .component_tracker
+                        .components
+                        .contains_key(id.as_str())
+                })
+                .map(|id| id.to_string())
+                .collect();
+            debug!(components=?requiring_snapshot, "SnapshotRequest");
+            let requiring_snapshot_refs: Vec<&String> = requiring_snapshot.iter().collect();
+            self.component_tracker
+                .start_tracking(&requiring_snapshot_refs)
+                .await?;
+
+            // When partial_blocks: defer brand-new to next block's first message; only preexisting
+            // get snapshot now.
+            let request_now: Vec<String> = if self.partial_blocks {
+                let (preexisting, brand_new) = requiring_snapshot
+                    .into_iter()
+                    .partition(|id| {
+                        !deltas
+                            .new_protocol_components
+                            .contains_key(id.as_str())
+                    });
+                self.deferred_snapshot_components
+                    .extend(brand_new);
+                preexisting
+            } else {
+                requiring_snapshot
+            };
+
+            let mut snapshots = if request_now.is_empty() {
+                Snapshot::default()
+            } else {
+                let snapshot_header = if self.partial_blocks && header.number > 0 {
+                    // get snapshot at the previous block (current block is only partial and not
+                    // available for querying)
+                    BlockHeader {
+                        number: header.number - 1,
+                        hash: header.parent_hash.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    BlockHeader { revert: false, ..header.clone() }
+                };
+                self.get_snapshots(snapshot_header, Some(&request_now))
+                    .await?
+                    .snapshots
+            };
+
+            snapshots.extend(flushed_snapshots);
+
+            let removed_components = if !to_remove.is_empty() {
+                self.component_tracker
+                    .stop_tracking(&to_remove)
+            } else {
+                Default::default()
+            };
+
+            (snapshots, removed_components)
+        };
+
+        // 3. Update entrypoints on the tracker (affects which contracts are tracked)
+        self.component_tracker
+            .process_entrypoints(&deltas.dci_update);
+
+        // 4. Filter deltas by currently tracked components / contracts
+        self.filter_deltas(&mut deltas);
+        let n_changes = deltas.n_changes();
+
+        // 5. Send the message
+        let next = StateSyncMessage {
+            header: header.clone(),
+            snapshots,
+            deltas: Some(deltas),
+            removed_components,
+        };
+        block_tx.send(Ok(next)).await?;
+        self.last_synced_block = Some(header.clone());
+
+        debug!(block_number=?header.number, n_changes, "Finished processing delta message");
+        Ok(())
     }
 
     fn is_next_expected(&self, incoming: &BlockHeader) -> bool {
@@ -811,6 +890,72 @@ mod test {
 
     use super::*;
     use crate::{deltas::MockDeltasClient, rpc::MockRPCClient, DeltasError, RPCError};
+
+    #[test_log::test(tokio::test)]
+    async fn test_initial_snapshot_drains_and_orders_live_deltas() {
+        let (tx, mut rx) = channel(1);
+        let (end_tx, mut end_rx) = oneshot::channel();
+        let snapshot_started = Arc::new(tokio::sync::Notify::new());
+        let release_snapshot = Arc::new(tokio::sync::Notify::new());
+
+        let started = snapshot_started.clone();
+        let release = release_snapshot.clone();
+        let snapshot_fut = async move {
+            started.notify_one();
+            release.notified().await;
+            Ok::<_, SynchronizerError>(42_u64)
+        };
+
+        let helper = tokio::spawn(async move {
+            let mut buffered_deltas = VecDeque::new();
+            let result = await_snapshot_while_buffering(
+                snapshot_fut,
+                &mut rx,
+                &mut end_rx,
+                &mut buffered_deltas,
+            )
+            .await;
+            (result, buffered_deltas)
+        });
+
+        snapshot_started.notified().await;
+        for number in [1, 2] {
+            timeout(
+                Duration::from_millis(100),
+                tx.send(BlockChanges {
+                    block: Block { number, ..Default::default() },
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("delta sender blocked while snapshot was pending")
+            .expect("deltas channel closed");
+        }
+
+        timeout(Duration::from_millis(100), async {
+            while tx.capacity() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("last delta was not drained while snapshot was pending");
+
+        release_snapshot.notify_one();
+        let (result, buffered_deltas) = helper
+            .await
+            .expect("snapshot buffering task panicked");
+
+        assert_eq!(result.expect("snapshot failed"), Some(42));
+        assert_eq!(
+            buffered_deltas
+                .iter()
+                .map(|delta| delta.block.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        drop(end_tx);
+    }
 
     // Required for mock client to implement clone
     struct ArcRPCClient<T>(Arc<T>);
@@ -1400,8 +1545,8 @@ mod test {
                  _chunk_size: &Option<usize>,
                  _concurrency: &usize| {
                     // Verify that the request contains ONLY Component2, not all tracked components
-                    request.components.len() == 1 &&
-                        request
+                    request.components.len() == 1
+                        && request
                             .components
                             .contains_key("Component2")
                 },
@@ -2509,8 +2654,8 @@ mod test {
             !first_snapshot
                 .snapshots
                 .states
-                .is_empty() ||
-                first_snapshot.deltas.is_some()
+                .is_empty()
+                || first_snapshot.deltas.is_some()
         );
         // Now send close signal - this should be handled in the main processing loop
         let _ = end_tx.send(());
@@ -3335,8 +3480,8 @@ mod test {
                 |request: &SnapshotParameters,
                  _chunk_size: &Option<usize>,
                  _concurrency: &usize| {
-                    request.block_number == 2 &&
-                        request
+                    request.block_number == 2
+                        && request
                             .components
                             .contains_key("BrandNew")
                 },
@@ -3370,8 +3515,8 @@ mod test {
                 |request: &SnapshotParameters,
                  _chunk_size: &Option<usize>,
                  _concurrency: &usize| {
-                    request.block_number == 1 &&
-                        request
+                    request.block_number == 1
+                        && request
                             .components
                             .contains_key("Preexisting")
                 },
