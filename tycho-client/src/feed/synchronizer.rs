@@ -1,6 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -10,7 +14,7 @@ use thiserror::Error;
 use tokio::{
     select,
     sync::{
-        mpsc::{channel, error::SendError, Receiver, Sender},
+        mpsc::{channel, error::SendError, unbounded_channel, Receiver, Sender, UnboundedReceiver},
         oneshot,
     },
     task::JoinHandle,
@@ -74,13 +78,66 @@ impl<T> From<SendError<T>> for SynchronizerError {
     }
 }
 
+const DELTA_BACKLOG_WARNING_INTERVAL: usize = 1024;
+
+/// Continuously drains the bounded websocket subscription channel into a local backlog.
+///
+/// State processing can pause while retrieving snapshots or waiting for the block synchronizer.
+/// Keeping this pump independent prevents those downstream pauses from filling the websocket
+/// subscription channel and forcing an unsubscribe.
+struct DeltaIngress {
+    rx: UnboundedReceiver<BlockChanges>,
+    pending: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl DeltaIngress {
+    fn new(mut source_rx: Receiver<BlockChanges>, extractor_id: ExtractorIdentity) -> Self {
+        let (tx, rx) = unbounded_channel();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let task_pending = pending.clone();
+        let task = tokio::spawn(async move {
+            while let Some(deltas) = source_rx.recv().await {
+                let pending_deltas = task_pending.fetch_add(1, Ordering::Relaxed) + 1;
+                if tx.send(deltas).is_err() {
+                    task_pending.fetch_sub(1, Ordering::Relaxed);
+                    break;
+                }
+                if pending_deltas % DELTA_BACKLOG_WARNING_INTERVAL == 0 {
+                    warn!(
+                        %extractor_id,
+                        pending_deltas,
+                        "Delta ingestion backlog is growing"
+                    );
+                }
+            }
+        });
+
+        Self { rx, pending, task }
+    }
+
+    async fn recv(&mut self) -> Option<BlockChanges> {
+        let deltas = self.rx.recv().await;
+        if deltas.is_some() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
+        deltas
+    }
+}
+
+impl Drop for DeltaIngress {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Waits for an initial snapshot while continuing to drain the live deltas channel.
 ///
 /// Snapshot retrieval can take longer than the deltas channel can buffer. Keeping the receiver
 /// active here prevents a slow snapshot request from causing the websocket client to unsubscribe.
 async fn await_snapshot_while_buffering<F, T>(
     snapshot_fut: F,
-    msg_rx: &mut Receiver<BlockChanges>,
+    delta_ingress: &mut DeltaIngress,
     end_rx: &mut oneshot::Receiver<()>,
     buffered_deltas: &mut VecDeque<BlockChanges>,
 ) -> SyncResult<Option<T>>
@@ -92,7 +149,7 @@ where
     loop {
         select! {
             snapshot = &mut snapshot_fut => return snapshot.map(Some),
-            deltas = msg_rx.recv() => {
+            deltas = delta_ingress.recv() => {
                 match deltas {
                     Some(deltas) => buffered_deltas.push_back(deltas),
                     None => {
@@ -491,7 +548,7 @@ where
             .with_state(self.include_snapshots)
             .with_compression(self.compression)
             .with_partial_blocks(self.partial_blocks);
-        let (subscription_id, mut msg_rx) = match self
+        let (subscription_id, msg_rx) = match self
             .deltas_client
             .subscribe(self.extractor_id.clone(), subscription_options)
             .await
@@ -499,6 +556,7 @@ where
             Ok(result) => result,
             Err(e) => return Err((e.into(), Some(end_rx))),
         };
+        let mut delta_ingress = DeltaIngress::new(msg_rx, self.extractor_id.clone());
 
         let result = async {
             info!("Waiting for deltas...");
@@ -508,7 +566,7 @@ where
             let mut last_block_number: Option<u64> = None;
             let mut first_msg = loop {
                 let msg = select! {
-                    deltas_result = timeout(Duration::from_secs(self.timeout), msg_rx.recv()) => {
+                    deltas_result = timeout(Duration::from_secs(self.timeout), delta_ingress.recv()) => {
                         deltas_result
                             .map_err(|_| {
                                 SynchronizerError::Timeout(format!(
@@ -609,7 +667,7 @@ where
                 };
                 let snapshot = match await_snapshot_while_buffering(
                     self.get_snapshots::<Vec<&String>>(snapshot_header, None),
-                    &mut msg_rx,
+                    &mut delta_ingress,
                     &mut end_rx,
                     &mut buffered_deltas,
                 )
@@ -643,7 +701,7 @@ where
                 }
 
                 select! {
-                    deltas_opt = msg_rx.recv() => {
+                    deltas_opt = delta_ingress.recv() => {
                         if let Some(deltas) = deltas_opt {
                             self.process_delta(block_tx, deltas).await?;
                         } else {
@@ -657,6 +715,8 @@ where
                 }
             }
         }.await;
+
+        drop(delta_ingress);
 
         // This cleanup code now runs regardless of how the function exits (error or channel close)
         warn!(last_synced_block = ?&self.last_synced_block, "Deltas processing ended.");
@@ -958,7 +1018,11 @@ mod test {
 
     #[test_log::test(tokio::test)]
     async fn test_initial_snapshot_drains_and_orders_live_deltas() {
-        let (tx, mut rx) = channel(1);
+        let (tx, rx) = channel(1);
+        let mut delta_ingress = DeltaIngress::new(
+            rx,
+            ExtractorIdentity::new(Chain::Ethereum, "snapshot-test"),
+        );
         let (end_tx, mut end_rx) = oneshot::channel();
         let snapshot_started = Arc::new(tokio::sync::Notify::new());
         let release_snapshot = Arc::new(tokio::sync::Notify::new());
@@ -975,7 +1039,7 @@ mod test {
             let mut buffered_deltas = VecDeque::new();
             let result = await_snapshot_while_buffering(
                 snapshot_fut,
-                &mut rx,
+                &mut delta_ingress,
                 &mut end_rx,
                 &mut buffered_deltas,
             )
@@ -1020,6 +1084,38 @@ mod test {
         );
 
         drop(end_tx);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_delta_ingress_drains_while_downstream_is_blocked() {
+        let (tx, rx) = channel(1);
+        let mut delta_ingress = DeltaIngress::new(
+            rx,
+            ExtractorIdentity::new(Chain::Ethereum, "ingress-test"),
+        );
+
+        timeout(Duration::from_secs(1), async {
+            for number in 1..=256 {
+                tx.send(BlockChanges {
+                    block: Block { number, ..Default::default() },
+                    ..Default::default()
+                })
+                .await
+                .expect("source deltas channel closed");
+            }
+        })
+        .await
+        .expect("bounded source channel filled while downstream was blocked");
+
+        drop(tx);
+        for expected in 1..=256 {
+            let deltas = timeout(Duration::from_millis(100), delta_ingress.recv())
+                .await
+                .expect("timed out draining delta backlog")
+                .expect("delta backlog ended early");
+            assert_eq!(deltas.block.number, expected);
+        }
+        assert!(delta_ingress.recv().await.is_none());
     }
 
     // Required for mock client to implement clone
