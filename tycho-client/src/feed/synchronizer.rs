@@ -454,12 +454,13 @@ where
         }
 
         // Use given ids or use all if not passed
-        let component_ids: Vec<_> = match ids {
+        let mut component_ids: Vec<_> = match ids {
             Some(ids) => ids.into_iter().cloned().collect(),
             None => self
                 .component_tracker
                 .get_tracked_component_ids(),
         };
+        component_ids.sort();
 
         if component_ids.is_empty() {
             return Ok(StateSyncMessage { header, ..Default::default() });
@@ -491,12 +492,14 @@ where
             .collect();
 
         // Filter components to only include the requested ones
-        let filtered_components: HashMap<_, _> = self
-            .component_tracker
-            .components
+        let filtered_components: HashMap<_, _> = component_ids
             .iter()
-            .filter(|(id, _)| component_ids.contains(id))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .filter_map(|id| {
+                self.component_tracker
+                    .components
+                    .get_key_value(id)
+                    .map(|(key, value)| (key.clone(), value.clone()))
+            })
             .collect();
 
         let request = SnapshotParameters::new(

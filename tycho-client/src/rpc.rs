@@ -168,8 +168,9 @@ pub trait RPCClient: Send + Sync {
         let mut sorted_ids = ids.to_vec();
         sorted_ids.sort();
 
-        let chunk_size = chunk_size
-            .unwrap_or(StateRequestBody::effective_max_page_size(self.compression()) as usize);
+        let chunk_size = chunk_size.unwrap_or_else(|| {
+            StateRequestBody::effective_max_page_size(self.compression()) as usize
+        });
 
         let chunked_bodies = sorted_ids
             .chunks(chunk_size)
@@ -198,14 +199,14 @@ pub trait RPCClient: Send + Sync {
         let responses = try_join_all(tasks).await?;
 
         // Aggregate the responses into a single result.
-        let accounts = responses
-            .iter()
-            .flat_map(|r| r.accounts.clone())
-            .collect();
         let total: i64 = responses
             .iter()
             .map(|r| r.pagination.total)
             .sum();
+        let accounts = responses
+            .into_iter()
+            .flat_map(|r| r.accounts)
+            .collect();
 
         Ok(StateRequestResponse {
             accounts,
@@ -228,9 +229,9 @@ pub trait RPCClient: Send + Sync {
     ) -> Result<ProtocolComponentRequestResponse, RPCError> {
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
-        let chunk_size = chunk_size.unwrap_or(
-            ProtocolComponentsRequestBody::effective_max_page_size(self.compression()) as usize,
-        );
+        let chunk_size = chunk_size.unwrap_or_else(|| {
+            ProtocolComponentsRequestBody::effective_max_page_size(self.compression()) as usize
+        });
 
         // If a set of component IDs is specified, the maximum return size is already known,
         // allowing us to pre-compute the number of requests to be made.
@@ -239,16 +240,12 @@ pub trait RPCClient: Send + Sync {
                 // We can divide the component_ids into chunks of size chunk_size
                 let chunked_bodies = ids
                     .chunks(chunk_size)
-                    .enumerate()
-                    .map(|(index, _)| ProtocolComponentsRequestBody {
+                    .map(|chunk| ProtocolComponentsRequestBody {
                         protocol_system: request.protocol_system.clone(),
-                        component_ids: request.component_ids.clone(),
+                        component_ids: Some(chunk.to_vec()),
                         tvl_gt: request.tvl_gt,
                         chain: request.chain,
-                        pagination: PaginationParams {
-                            page: index as i64,
-                            page_size: chunk_size as i64,
-                        },
+                        pagination: PaginationParams { page: 0, page_size: chunk_size as i64 },
                     })
                     .collect::<Vec<_>>();
 
@@ -395,9 +392,9 @@ pub trait RPCClient: Send + Sync {
     {
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
-        let chunk_size = chunk_size.unwrap_or(ProtocolStateRequestBody::effective_max_page_size(
-            self.compression(),
-        ) as usize);
+        let chunk_size = chunk_size.unwrap_or_else(|| {
+            ProtocolStateRequestBody::effective_max_page_size(self.compression()) as usize
+        });
 
         let chunked_bodies = ids
             .chunks(chunk_size)
@@ -430,15 +427,14 @@ pub trait RPCClient: Send + Sync {
         try_join_all(tasks)
             .await
             .map(|responses| {
-                let states = responses
-                    .clone()
-                    .into_iter()
-                    .flat_map(|r| r.states)
-                    .collect();
                 let total = responses
                     .iter()
                     .map(|r| r.pagination.total)
                     .sum();
+                let states = responses
+                    .into_iter()
+                    .flat_map(|r| r.states)
+                    .collect();
                 ProtocolStateRequestResponse {
                     states,
                     pagination: PaginationResponse { page: 0, page_size: chunk_size as i64, total },
@@ -463,8 +459,9 @@ pub trait RPCClient: Send + Sync {
         chunk_size: Option<usize>,
         concurrency: usize,
     ) -> Result<Vec<ResponseToken>, RPCError> {
-        let chunk_size = chunk_size
-            .unwrap_or(TokensRequestBody::effective_max_page_size(self.compression()) as usize);
+        let chunk_size = chunk_size.unwrap_or_else(|| {
+            TokensRequestBody::effective_max_page_size(self.compression()) as usize
+        });
 
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
@@ -548,23 +545,19 @@ pub trait RPCClient: Send + Sync {
     ) -> Result<ComponentTvlRequestResponse, RPCError> {
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
-        let chunk_size = chunk_size.unwrap_or(ComponentTvlRequestBody::effective_max_page_size(
-            self.compression(),
-        ) as usize);
+        let chunk_size = chunk_size.unwrap_or_else(|| {
+            ComponentTvlRequestBody::effective_max_page_size(self.compression()) as usize
+        });
 
         match request.component_ids {
             Some(ref ids) => {
                 let chunked_requests = ids
                     .chunks(chunk_size)
-                    .enumerate()
-                    .map(|(index, _)| ComponentTvlRequestBody {
+                    .map(|chunk| ComponentTvlRequestBody {
                         chain: request.chain,
                         protocol_system: request.protocol_system.clone(),
-                        component_ids: Some(ids.clone()),
-                        pagination: PaginationParams {
-                            page: index as i64,
-                            page_size: chunk_size as i64,
-                        },
+                        component_ids: Some(chunk.to_vec()),
+                        pagination: PaginationParams { page: 0, page_size: chunk_size as i64 },
                     })
                     .collect::<Vec<_>>();
 
@@ -686,9 +679,9 @@ pub trait RPCClient: Send + Sync {
     ) -> Result<TracedEntryPointRequestResponse, RPCError> {
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
-        let chunk_size = chunk_size.unwrap_or(
-            TracedEntryPointRequestBody::effective_max_page_size(self.compression()) as usize,
-        );
+        let chunk_size = chunk_size.unwrap_or_else(|| {
+            TracedEntryPointRequestBody::effective_max_page_size(self.compression()) as usize
+        });
 
         let chunked_bodies = component_ids
             .chunks(chunk_size)
@@ -715,15 +708,14 @@ pub trait RPCClient: Send + Sync {
         try_join_all(tasks)
             .await
             .map(|responses| {
-                let traced_entry_points = responses
-                    .clone()
-                    .into_iter()
-                    .flat_map(|r| r.traced_entry_points)
-                    .collect();
                 let total = responses
                     .iter()
                     .map(|r| r.pagination.total)
                     .sum();
+                let traced_entry_points = responses
+                    .into_iter()
+                    .flat_map(|r| r.traced_entry_points)
+                    .collect();
                 TracedEntryPointRequestResponse {
                     traced_entry_points,
                     pagination: PaginationResponse { page: 0, page_size: chunk_size as i64, total },
@@ -1232,11 +1224,12 @@ impl RPCClient for HttpRPCClient {
         chunk_size: Option<usize>,
         concurrency: usize,
     ) -> Result<Snapshot, RPCError> {
-        let component_ids: Vec<_> = request
+        let mut component_ids: Vec<_> = request
             .components
             .keys()
             .cloned()
             .collect();
+        component_ids.sort();
 
         let version = VersionParam::new(
             None,
@@ -1300,12 +1293,9 @@ impl RPCClient for HttpRPCClient {
                                 .unwrap_or_default(),
                         },
                     ))
-                } else if component_ids.contains(&component.id) {
-                    // only emit error event if we requested this component
+                } else {
                     let component_id = &component.id;
                     error!(?component_id, "Missing state for native component!");
-                    None
-                } else {
                     None
                 }
             })
@@ -1331,19 +1321,12 @@ impl RPCClient for HttpRPCClient {
 
             let contract_address_to_components = request
                 .components
-                .iter()
-                .filter_map(|(id, comp)| {
-                    if component_ids.contains(id) {
-                        Some(
-                            comp.contract_ids
-                                .iter()
-                                .map(|address| (address.clone(), comp.id.clone())),
-                        )
-                    } else {
-                        None
-                    }
+                .values()
+                .flat_map(|comp| {
+                    comp.contract_ids
+                        .iter()
+                        .map(|address| (address.clone(), comp.id.clone()))
                 })
-                .flatten()
                 .fold(HashMap::<Bytes, Vec<String>>::new(), |mut acc, (addr, c_id)| {
                     acc.entry(addr).or_default().push(c_id);
                     acc
@@ -1424,6 +1407,113 @@ mod tests {
                     pagination: PaginationParams { page: 0, page_size: chunk_size as i64 },
                 })
                 .collect()
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRPCClient {
+        component_requests: std::sync::Mutex<Vec<ProtocolComponentsRequestBody>>,
+        tvl_requests: std::sync::Mutex<Vec<ComponentTvlRequestBody>>,
+    }
+
+    #[async_trait]
+    impl RPCClient for RecordingRPCClient {
+        fn compression(&self) -> bool {
+            true
+        }
+
+        async fn get_contract_state(
+            &self,
+            _request: &StateRequestBody,
+        ) -> Result<StateRequestResponse, RPCError> {
+            unimplemented!("not used by pagination tests")
+        }
+
+        async fn get_protocol_components(
+            &self,
+            request: &ProtocolComponentsRequestBody,
+        ) -> Result<ProtocolComponentRequestResponse, RPCError> {
+            self.component_requests
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            Ok(ProtocolComponentRequestResponse::new(
+                vec![],
+                PaginationResponse {
+                    page: request.pagination.page,
+                    page_size: request.pagination.page_size,
+                    total: request
+                        .component_ids
+                        .as_ref()
+                        .map_or(0, |ids| ids.len() as i64),
+                },
+            ))
+        }
+
+        async fn get_protocol_states(
+            &self,
+            _request: &ProtocolStateRequestBody,
+        ) -> Result<ProtocolStateRequestResponse, RPCError> {
+            unimplemented!("not used by pagination tests")
+        }
+
+        async fn get_tokens(
+            &self,
+            _request: &TokensRequestBody,
+        ) -> Result<TokensRequestResponse, RPCError> {
+            unimplemented!("not used by pagination tests")
+        }
+
+        async fn get_protocol_systems(
+            &self,
+            _request: &ProtocolSystemsRequestBody,
+        ) -> Result<ProtocolSystemsRequestResponse, RPCError> {
+            unimplemented!("not used by pagination tests")
+        }
+
+        async fn get_component_tvl(
+            &self,
+            request: &ComponentTvlRequestBody,
+        ) -> Result<ComponentTvlRequestResponse, RPCError> {
+            self.tvl_requests
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            let tvl = request
+                .component_ids
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(|id| (id, 1.0))
+                .collect();
+            Ok(ComponentTvlRequestResponse::new(
+                tvl,
+                PaginationResponse {
+                    page: request.pagination.page,
+                    page_size: request.pagination.page_size,
+                    total: request
+                        .component_ids
+                        .as_ref()
+                        .map_or(0, |ids| ids.len() as i64),
+                },
+            ))
+        }
+
+        async fn get_traced_entry_points(
+            &self,
+            _request: &TracedEntryPointRequestBody,
+        ) -> Result<TracedEntryPointRequestResponse, RPCError> {
+            unimplemented!("not used by pagination tests")
+        }
+
+        async fn get_snapshots<'a>(
+            &self,
+            _request: &SnapshotParameters<'a>,
+            _chunk_size: Option<usize>,
+            _concurrency: usize,
+        ) -> Result<Snapshot, RPCError> {
+            unimplemented!("not used by pagination tests")
         }
     }
 
@@ -2811,6 +2901,39 @@ mod tests {
         mocked_server.assert();
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].native_balance, Bytes::from(500u16.to_be_bytes()));
+    }
+
+    #[tokio::test]
+    async fn test_get_protocol_components_chunks_id_filter() {
+        let component_ids = (0..5)
+            .map(|index| format!("component-{index}"))
+            .collect::<Vec<_>>();
+        let client = RecordingRPCClient::default();
+        let request = ProtocolComponentsRequestBody {
+            protocol_system: "test_protocol".to_string(),
+            component_ids: Some(component_ids.clone()),
+            tvl_gt: None,
+            chain: Chain::Ethereum,
+            pagination: Default::default(),
+        };
+
+        let response = client
+            .get_protocol_components_paginated(&request, Some(2), 3)
+            .await
+            .expect("get protocol components");
+
+        assert_eq!(response.pagination.total, 5);
+        let requests = client.component_requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| request.pagination.page == 0));
+        assert!(requests
+            .iter()
+            .all(|request| request.pagination.page_size == 2));
+        let requested_ids = requests
+            .iter()
+            .flat_map(|request| request.component_ids.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requested_ids, component_ids);
     }
 
     #[rstest]
