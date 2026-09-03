@@ -1710,7 +1710,7 @@ pub struct ComponentTvlRequestBody {
 }
 
 // When INCREASING these limits, please read the warning in the macro definition.
-impl_pagination_limits!(ComponentTvlRequestBody, compressed = 100, uncompressed = 100);
+impl_pagination_limits!(ComponentTvlRequestBody, compressed = 2550, uncompressed = 100);
 
 impl ComponentTvlRequestBody {
     pub fn system_filtered(system: &str, chain: Chain) -> Self {

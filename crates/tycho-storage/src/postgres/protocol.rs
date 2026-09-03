@@ -556,11 +556,25 @@ impl PostgresGateway {
             count_query = count_query.filter(schema::component_tvl::tvl.gt(thr));
         }
 
-        let count = count_query
-            .count()
-            .get_result::<i64>(conn)
-            .await
-            .map_err(PostgresError::from)?;
+        // ID-filtered requests from tycho-client send one complete chunk at page zero. In that
+        // case the result length is the total, so avoid issuing an identical second query solely
+        // to count the rows.
+        let can_derive_count = ids.is_some_and(|ids| {
+            pagination_params.is_none_or(|pagination| {
+                pagination.page == 0 && pagination.page_size >= ids.len() as i64
+            })
+        });
+        let count = if can_derive_count {
+            None
+        } else {
+            Some(
+                count_query
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await
+                    .map_err(PostgresError::from)?,
+            )
+        };
 
         // Apply optional pagination when loading protocol components to ensure consistency
         if let Some(pagination) = pagination_params {
@@ -581,6 +595,7 @@ impl PostgresGateway {
         let res = self
             .build_protocol_components(orm_protocol_components, chain, conn)
             .await?;
+        let count = count.unwrap_or(res.len() as i64);
 
         Ok(WithTotal { entity: res, total: Some(count) })
     }
@@ -2704,11 +2719,25 @@ impl PostgresGateway {
                 .offset(pagination.offset());
         }
 
-        let count = count_query
-            .count()
-            .get_result::<i64>(conn)
-            .await
-            .map_err(PostgresError::from)?;
+        // ID-filtered requests from tycho-client send one complete chunk at page zero. In that
+        // case the result length is the total, so avoid issuing an identical second query solely
+        // to count the rows.
+        let can_derive_count = component_ids.is_some_and(|ids| {
+            pagination_params.is_none_or(|pagination| {
+                pagination.page == 0 && pagination.page_size >= ids.len() as i64
+            })
+        });
+        let count = if can_derive_count {
+            None
+        } else {
+            Some(
+                count_query
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await
+                    .map_err(PostgresError::from)?,
+            )
+        };
 
         let rows: Vec<(String, f64)> = query
             .select((pc::external_id, ct::tvl))
@@ -2724,6 +2753,7 @@ impl PostgresGateway {
         let result = rows
             .into_iter()
             .collect::<HashMap<_, _>>();
+        let count = count.unwrap_or(result.len() as i64);
 
         Ok(WithTotal { entity: result, total: Some(count) })
     }
