@@ -1,7 +1,7 @@
 specVersion: v0.1.0
 package:
   name: "base_uniswap_v4_fees"
-  version: v0.1.0
+  version: v0.1.1
 
 protobuf:
   files:
@@ -21,7 +21,7 @@ binaries:
 modules:
   - name: map_protocol_fee_changes
     kind: map
-    initialBlock: 21688329
+    initialBlock: 49130000
     inputs:
       - params: string
       - source: sf.ethereum.type.v2.Block
@@ -29,4 +29,4 @@ modules:
       type: proto:tycho.evm.v1.BlockChanges
 
 params:
-  map_protocol_fee_changes: "pool_manager=498581fF718922c3f8e6A244956aF099B2652b2b&component_creation_block=21688329"
+  map_protocol_fee_changes: "pool_manager=498581ff718922c3f8e6a244956af099b2652b2b&component_creation_block=49130000"
