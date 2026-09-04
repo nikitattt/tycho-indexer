@@ -668,13 +668,6 @@ impl PostgresGateway {
 
         rows.into_iter()
             .map(|row| {
-                if row.token_addresses.is_empty() {
-                    return Err(StorageError::NotFound(
-                        "ProtocolComponent tokens".to_string(),
-                        row.external_id,
-                    ));
-                }
-
                 let static_attributes: HashMap<String, StoreVal> =
                     if let Some(attributes) = row.attributes {
                         serde_json::from_value(attributes).map_err(|_| {
@@ -786,9 +779,8 @@ impl PostgresGateway {
                 let ps = self.get_protocol_system(&pc.protocol_system_id)?;
                 let tokens_by_pc: Vec<Address> = protocol_component_tokens
                     .get(&pc.id)
-                    // We expect all protocol components to have tokens.
-                    .expect("Could not find Tokens for Protocol Component.")
-                    .clone();
+                    .cloned()
+                    .unwrap_or_default();
                 let contracts_by_pc: Vec<Address> = protocol_component_contracts
                     .get(&pc.id)
                     .cloned()
@@ -4377,6 +4369,67 @@ mod test {
 
         assert_eq!(result.entity.len(), 2);
         assert_eq!(result.total, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_get_tokenless_protocol_component() {
+        let mut conn = setup_db().await;
+        let (chain_id, tx_hashes) = setup_data(&mut conn).await;
+        let gw = EVMGateway::from_connection(&mut conn).await;
+        let protocol_system_id =
+            db_fixtures::insert_protocol_system(&mut conn, "tokenless".to_owned()).await;
+        let protocol_type_id = db_fixtures::insert_protocol_type(
+            &mut conn,
+            "Tokenless",
+            Some(FinancialType::Swap),
+            None,
+            Some(ImplementationType::Custom),
+        )
+        .await;
+        let creation_tx = schema::transaction::table
+            .filter(schema::transaction::hash.eq(Bytes::from(tx_hashes[0].as_str())))
+            .select(schema::transaction::id)
+            .first::<i64>(&mut conn)
+            .await
+            .expect("failed to find creation transaction");
+
+        db_fixtures::insert_protocol_component(
+            &mut conn,
+            "tokenless-component",
+            chain_id,
+            protocol_system_id,
+            protocol_type_id,
+            creation_tx,
+            None,
+            None,
+        )
+        .await;
+
+        let all_components = gw
+            .get_protocol_components(&Chain::Ethereum, None, None, None, None, &mut conn)
+            .await
+            .expect("failed to retrieve all components")
+            .entity;
+        let tokenless_component = all_components
+            .iter()
+            .find(|component| component.id == "tokenless-component")
+            .expect("tokenless component missing from unfiltered result");
+        assert!(tokenless_component.tokens.is_empty());
+
+        let filtered_components = gw
+            .get_protocol_components(
+                &Chain::Ethereum,
+                Some("tokenless".to_owned()),
+                None,
+                None,
+                None,
+                &mut conn,
+            )
+            .await
+            .expect("failed to retrieve filtered components")
+            .entity;
+        assert_eq!(filtered_components.len(), 1);
+        assert!(filtered_components[0].tokens.is_empty());
     }
 
     #[rstest]
