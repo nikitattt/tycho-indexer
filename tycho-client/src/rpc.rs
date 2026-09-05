@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -22,7 +22,7 @@ use tokio::{
     sync::{RwLock, Semaphore},
     time::sleep,
 };
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 use tycho_common::{
     dto::{
         BlockParam, Chain, ComponentTvlRequestBody, ComponentTvlRequestResponse,
@@ -739,6 +739,9 @@ pub struct HttpRPCClientOptions {
     /// Enable compression for requests (default: true)
     /// When enabled, adds Accept-Encoding: zstd header
     pub compression: bool,
+    /// Optional protocol-state concurrency override, shared across this client's clones.
+    /// When omitted, snapshot loading uses its caller's concurrency without a shared cap.
+    pub protocol_state_concurrency: Option<usize>,
 }
 
 impl Default for HttpRPCClientOptions {
@@ -750,7 +753,7 @@ impl Default for HttpRPCClientOptions {
 impl HttpRPCClientOptions {
     /// Create new options with default values (compression enabled)
     pub fn new() -> Self {
-        Self { auth_key: None, compression: true }
+        Self { auth_key: None, compression: true, protocol_state_concurrency: None }
     }
 
     /// Set the authentication key
@@ -764,6 +767,15 @@ impl HttpRPCClientOptions {
         self.compression = compression;
         self
     }
+
+    /// Overrides snapshot protocol-state concurrency and caps protocol-state fetches across clones.
+    /// Other RPC endpoints and page sizes are unaffected. Independently constructed clients have
+    /// separate limits. `HttpRPCClient::new` rejects zero and values above
+    /// `Semaphore::MAX_PERMITS`.
+    pub fn with_protocol_state_concurrency(mut self, concurrency: usize) -> Self {
+        self.protocol_state_concurrency = Some(concurrency);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -774,10 +786,20 @@ pub struct HttpRPCClient {
     backoff_policy: ExponentialBackoff,
     server_restart_duration: Duration,
     compression: bool,
+    protocol_state_concurrency: Option<usize>,
+    protocol_state_semaphore: Option<Arc<Semaphore>>,
 }
 
 impl HttpRPCClient {
     pub fn new(base_uri: &str, options: HttpRPCClientOptions) -> Result<Self, RPCError> {
+        if let Some(concurrency) = options.protocol_state_concurrency {
+            if concurrency == 0 || concurrency > Semaphore::MAX_PERMITS {
+                return Err(RPCError::FormatRequest(format!(
+                    "Protocol-state concurrency must be between 1 and {} (got {concurrency})",
+                    Semaphore::MAX_PERMITS,
+                )));
+            }
+        }
         let uri = base_uri
             .parse::<Url>()
             .map_err(|e| RPCError::UrlParsing(base_uri.to_string(), e.to_string()))?;
@@ -829,6 +851,10 @@ impl HttpRPCClient {
                 .build(),
             server_restart_duration: Duration::from_secs(120),
             compression: options.compression,
+            protocol_state_concurrency: options.protocol_state_concurrency,
+            protocol_state_semaphore: options
+                .protocol_state_concurrency
+                .map(|concurrency| Arc::new(Semaphore::new(concurrency))),
         })
     }
 
@@ -1054,6 +1080,19 @@ impl RPCClient for HttpRPCClient {
         &self,
         request: &ProtocolStateRequestBody,
     ) -> Result<ProtocolStateRequestResponse, RPCError> {
+        let wait_started = Instant::now();
+        // Hold the shared permit through download and decoding, not just response headers.
+        let _permit = match &self.protocol_state_semaphore {
+            Some(semaphore) => Some(
+                semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| RPCError::Fatal("Protocol-state semaphore closed".to_string()))?,
+            ),
+            None => None,
+        };
+        let permit_wait_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+        let request_started = Instant::now();
         // Check if protocol ids are specified
         if request
             .protocol_ids
@@ -1083,6 +1122,15 @@ impl RPCClient for HttpRPCClient {
             .await
             .map_err(|e| RPCError::ParseResponse(e.to_string()))?;
 
+        let request_ms = request_started.elapsed().as_secs_f64() * 1000.0;
+        debug!(
+            protocol_system = %request.protocol_system,
+            pool_count = request.protocol_ids.as_ref().map_or(0, Vec::len),
+            permit_wait_ms,
+            request_ms,
+            decoded_body_bytes = body.len(),
+            "Downloaded protocol-state page"
+        );
         if body.is_empty() {
             // Pure VM protocols will return empty states
             return Ok(ProtocolStateRequestResponse {
@@ -1095,8 +1143,15 @@ impl RPCClient for HttpRPCClient {
             });
         }
 
+        let decode_started = Instant::now();
         let states = serde_json::from_str::<ProtocolStateRequestResponse>(&body)
             .map_err(|err| RPCError::ParseResponse(format!("Error: {err}, Body: {body}")))?;
+        debug!(
+            protocol_system = %request.protocol_system,
+            pool_count = states.states.len(),
+            decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0,
+            "Decoded protocol-state page"
+        );
         trace!(?states, "Received protocol_states response from Tycho server");
 
         Ok(states)
@@ -1253,20 +1308,35 @@ impl RPCClient for HttpRPCClient {
         };
 
         let mut protocol_states = if !component_ids.is_empty() {
-            self.get_protocol_states_paginated(
-                request.chain,
-                &component_ids,
-                request.protocol_system,
-                request.include_balances,
-                &version,
-                chunk_size,
-                concurrency,
-            )
-            .await?
-            .states
-            .into_iter()
-            .map(|state| (state.component_id.clone(), state))
-            .collect()
+            let state_concurrency = self
+                .protocol_state_concurrency
+                .unwrap_or(concurrency);
+            let started = Instant::now();
+            let response = self
+                .get_protocol_states_paginated(
+                    request.chain,
+                    &component_ids,
+                    request.protocol_system,
+                    request.include_balances,
+                    &version,
+                    chunk_size,
+                    state_concurrency,
+                )
+                .await?;
+            info!(
+                protocol_system = request.protocol_system,
+                block_number = request.block_number,
+                pool_count = response.states.len(),
+                concurrency = state_concurrency,
+                shared_limit = ?self.protocol_state_concurrency,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "Loaded protocol-state snapshot"
+            );
+            response
+                .states
+                .into_iter()
+                .map(|state| (state.component_id.clone(), state))
+                .collect()
         } else {
             HashMap::new()
         };
@@ -2041,7 +2111,8 @@ mod tests {
         assert!(parse_retry_value("invalid").is_none());
         assert!(parse_retry_value("").is_none());
         assert!(parse_retry_value("not_a_number").is_none());
-        assert!(parse_retry_value("Mon, 32 Jan 2030 25:00:00 +0000").is_none()); // Invalid date
+        assert!(parse_retry_value("Mon, 32 Jan 2030 25:00:00 +0000").is_none());
+        // Invalid date
     }
 
     #[tokio::test]
@@ -2923,9 +2994,14 @@ mod tests {
             .expect("get protocol components");
 
         assert_eq!(response.pagination.total, 5);
-        let requests = client.component_requests.lock().unwrap();
+        let requests = client
+            .component_requests
+            .lock()
+            .unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(requests.iter().all(|request| request.pagination.page == 0));
+        assert!(requests
+            .iter()
+            .all(|request| request.pagination.page == 0));
         assert!(requests
             .iter()
             .all(|request| request.pagination.page_size == 2));

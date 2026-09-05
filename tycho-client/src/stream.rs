@@ -69,6 +69,7 @@ pub struct TychoStreamBuilder {
     include_tvl: bool,
     compression: bool,
     partial_blocks: bool,
+    protocol_state_concurrency: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +106,7 @@ impl TychoStreamBuilder {
             include_tvl: false,
             compression: true,
             partial_blocks: false,
+            protocol_state_concurrency: None,
         }
     }
 
@@ -218,6 +220,16 @@ impl TychoStreamBuilder {
         self
     }
 
+    /// Sets the maximum concurrent protocol-state fetches shared by this stream's exchanges.
+    /// Also uses this concurrency for each exchange's protocol-state snapshot pagination.
+    /// Without an override, the existing per-exchange concurrency of four is preserved.
+    /// Page sizes and other RPC endpoints are unaffected. `build` rejects zero and values above
+    /// `tokio::sync::Semaphore::MAX_PERMITS`.
+    pub fn protocol_state_concurrency(mut self, concurrency: usize) -> Self {
+        self.protocol_state_concurrency = Some(concurrency);
+        self
+    }
+
     /// Disables compression for RPC and WebSocket communication.
     /// By default, messages are compressed using zstd.
     pub fn disable_compression(mut self) -> Self {
@@ -285,13 +297,14 @@ impl TychoStreamBuilder {
             ),
         }
         .map_err(|e| StreamError::SetUpError(e.to_string()))?;
-        let rpc_client = HttpRPCClient::new(
-            &tycho_rpc_url,
-            HttpRPCClientOptions::new()
-                .with_auth_key(auth_key)
-                .with_compression(self.compression),
-        )
-        .map_err(|e| StreamError::SetUpError(e.to_string()))?;
+        let mut rpc_options = HttpRPCClientOptions::new()
+            .with_auth_key(auth_key)
+            .with_compression(self.compression);
+        if let Some(concurrency) = self.protocol_state_concurrency {
+            rpc_options = rpc_options.with_protocol_state_concurrency(concurrency);
+        }
+        let rpc_client = HttpRPCClient::new(&tycho_rpc_url, rpc_options)
+            .map_err(|e| StreamError::SetUpError(e.to_string()))?;
         let ws_jh = ws_client
             .connect()
             .await
@@ -547,6 +560,21 @@ mod tests {
             .build()
             .await;
         assert!(receiver.is_err(), "Client should fail to build when no exchanges are registered.");
+    }
+
+    #[rstest::rstest]
+    #[case(0)]
+    #[case(tokio::sync::Semaphore::MAX_PERMITS + 1)]
+    #[tokio::test]
+    async fn test_invalid_protocol_state_concurrency(#[case] concurrency: usize) {
+        let result = TychoStreamBuilder::new("localhost:4242", Chain::Ethereum)
+            .exchange("uniswap_v3", ComponentFilter::Ids(vec!["pool".to_string()]))
+            .protocol_state_concurrency(concurrency)
+            .build()
+            .await;
+        assert!(
+            matches!(result, Err(StreamError::SetUpError(message)) if message.contains("Protocol-state concurrency"))
+        );
     }
 
     #[ignore = "require tycho gateway"]
